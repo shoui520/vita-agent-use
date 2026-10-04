@@ -1,0 +1,110 @@
+version: 2
+firmware: 3.65
+modules:
+  SceCtrl:
+    nid: 0xC3B4D605
+    libraries:
+      SceCtrlForDriver:
+        kernel: true
+        nid: 0x7823A5D1
+        functions:
+          vauCtrlGetRoutingProcess: 0xDA07E970
+  ScePaf:
+    nid: 0xCD679177
+    libraries:
+      ScePafToplevel:
+        kernel: false
+        nid: 0x4D9A9DD0
+        functions:
+          vauPafFindPlugin: 0x004D98CC
+      ScePafStdc:
+        kernel: false
+        nid: 0xA7D28DAE
+        functions:
+          vauPafMalloc: 0xFC5CD359
+          vauPafFree: 0x1B77082E
+      ScePafThread:
+        kernel: false
+        nid: 0x54276D19
+        functions:
+          vauPafPostJob: 0x23B8F66F
+        variables:
+          vauPafMainQueue: 0x83CE85DD
+  SceCommonGuiDialog:
+    nid: 0xBFD4BF55
+    libraries:
+      SceCommonGuiDialog:
+        kernel: false
+        nid: 0x4B4AAE97
+        functions:
+          vauGuiBaseParameters: 0x696DB9C9
+          vauGuiOpen: 0xCCFCD9A6
+          vauGuiClose: 0x11D35CB5
+        variables:
+          vauGuiOkCancelLayout: 0x92752DE2
+          vauGuiOkLayout: 0xAF75CA6D
+  SceNotificationUtil:
+    nid: 0x9E920AA5
+    libraries:
+      SceNotificationUtil:
+        kernel: false
+        nid: 0xE19097C3
+        functions:
+          vauNotificationSend: 0xDE6F33F4
+      SceNotificationUtilProgress:
+        kernel: false
+        nid: 0x75602769
+        functions:
+          vauNotificationBegin: 0xFD0769B0
+          vauNotificationFinish: 0x8CD688A1
+  SceShellSvc:
+    nid: 0x833B7F3C
+    libraries:
+      SceShellSvc:
+        kernel: false
+        nid: 0x773242C7
+        functions:
+          vauShellSvcClient: 0xB31E7F1C
+  SceRegMgr:
+    nid: 0x3484FF0A
+    libraries:
+      SceRegMgrForSDK:
+        kernel: false
+        nid: 0x67E45817
+        functions:
+          vauRegSystemParamGetInt: 0x8154D696
+  SceSqlite:
+    nid: 0x838A7B9A
+    libraries:
+      SceSqlite:
+        kernel: false
+        nid: 0x67F02E1D
+        functions:
+          sqlite3_vfs_find: 0x0C6DD8C3
+          sqlite3_vfs_register: 0x65F53B9C
+          sqlite3_config: 0x96C5D388
+          sqlite3_exec: 0x2371E86A
+          sqlite3_open_v2: 0xA1E98A41
+          sqlite3_close: 0x7DF94B79
+          sqlite3_prepare_v2: 0xBC4BDCF4
+          sqlite3_bind_text: 0x613AB709
+          sqlite3_step: 0xCA8755B7
+          sqlite3_column_type: 0xDBB25C43
+          sqlite3_column_blob: 0xFE237ED7
+          sqlite3_column_text: 0x8E68D270
+          sqlite3_column_bytes: 0x36013FE4
+          sqlite3_finalize: 0xB656B7E2
+  SceSysmem:
+    nid: 0x4DC73B57
+    libraries:
+      SceSysmemForKernel:
+        kernel: true
+        nid: 0x02451F0F
+        functions:
+          vauGetPhyMemPartInfo: 0xB9B69700
+      SceSysrootForKernel:
+        kernel: true
+        nid: 0x3691DA45
+        functions:
+          vauSysrootCurrentAddressSpace: 0x63EBB05B
+          vauSysrootProcessTitle: 0xEC3124A3

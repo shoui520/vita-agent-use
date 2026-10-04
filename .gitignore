@@ -1,0 +1,8 @@
+/build-*/
+/CMakeUserPresets.json
+*.vpk
+*.velf
+*.self
+__pycache__/
+*.pyc
+/agent/

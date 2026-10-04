@@ -1,0 +1,29 @@
+vita_agent_kernel:
+  attributes: 0
+  version:
+    major: 0
+    minor: 1
+  main:
+    start: module_start
+    stop: module_stop
+  libraries:
+    vita_agent_kernel:
+      syscall: true
+      functions:
+        - vauInputAcquire
+        - vauInputAcquireForProcess
+        - vauInputHeartbeat
+        - vauInputSubmit
+        - vauInputSubmitTouch
+        - vauInputEnqueue
+        - vauInputCancel
+        - vauInputRelease
+        - vauInputGetStatus
+        - vauInputSetApprovalGate
+        - vauInputGetObservation
+        - vauInputGetStopStatus
+        - vauInputRearm
+        - vauScreenCapture
+        - vauPluginState
+        - vauPerformanceRead
+        - vauDumpEvents
