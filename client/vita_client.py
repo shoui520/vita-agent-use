@@ -12,6 +12,7 @@ import hashlib
 import hmac
 import http.client
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -21,6 +22,7 @@ import struct
 import sys
 import tempfile
 import threading
+import time
 from input_sequence import validate as validate_readable_events
 
 
@@ -132,7 +134,7 @@ class VitaClient:
         self._screen_cleanup_error = None
         self.retry_disconnect = retry_disconnect
         required = {'host', 'port', 'token', 'certificate_sha256', 'client_certificate', 'client_key'}
-        if not required <= set(credentials) or set(credentials) - (required | {'agent_name'}):
+        if not required <= set(credentials) or set(credentials) - (required | {'agent_name', 'session_expires_at'}):
             raise ClientError('Invalid credential fields.')
         for field in ('client_certificate', 'client_key'):
             if not isinstance(credentials[field], str) or not Path(credentials[field]).is_absolute():
@@ -153,10 +155,14 @@ class VitaClient:
             raise ClientError('Invalid pairing token or certificate fingerprint.')
         if not 0 < timeout <= 60:
             raise ClientError('Timeout must be between zero and 60 seconds.')
+        self.session_expires_at = credentials.get('session_expires_at')
+        if self.session_expires_at is not None and (type(self.session_expires_at) not in (int,float) or not math.isfinite(self.session_expires_at) or self.session_expires_at <= 0):
+            raise ClientError('Invalid session expiry timestamp.')
+        self.session_deadline = None if self.session_expires_at is None else time.monotonic()+max(0,self.session_expires_at-time.time())
         self.timeout = timeout
         self._connection = None
         self.path = Path(state_path)
-        self.identity = hashlib.sha256(json.dumps({k: v for k, v in credentials.items() if k != 'agent_name'}, sort_keys=True).encode()).hexdigest()
+        self.identity = hashlib.sha256(json.dumps({k: v for k, v in credentials.items() if k not in ('agent_name', 'session_expires_at')}, sort_keys=True).encode()).hexdigest()
 
     @contextmanager
     def _locked_state(self):

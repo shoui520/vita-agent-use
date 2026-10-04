@@ -32,8 +32,10 @@ Large negative numbers are Sony codes, not these. Keep both the signed decimal a
 | 8847 refused but 8848 active | An existing session owns the service; use its server instead of re-pairing. |
 | Command port refused right after reconnect or reboot | The listener isn't ready yet. Let the existing readiness/reconnect logic handle it; do not hammer the port. |
 | Timeout, reset or truncated response | The command may have run. Recover the exact pending request before doing anything else with effects; check the journal, diagnostics and current task. |
+| TLS unknown CA during pairing/session connect | This PC certificate was rejected. The Vita accepts only one saved peer; a second identity cannot reach the approval dialog. Reuse the trusted identity or have the human follow the peer replacement below. The rejected TLS handshake cannot expose the trusted peer name/fingerprint. |
 | TLS pin mismatch | Stop. Check whether the IP or device is wrong, or the identity was deliberately reset. Never disable pinning or send tokens to the unexpected device. Re-pair only as a deliberate reset with human approval. |
 | HTTP 401 or expired grant | Normal expiry: `session connect` or a server reconnect. If the human stopped access, respect that. |
+| Failed read-only request under `serve` | The server can recover observations automatically; snapshots and filesystem/app listings or stats retry once after renewing a lost session. If renewal fails, keep the error and state and retry after `server status` becomes connected. Writes/input/app control are never automatically resubmitted with a new ID. |
 | "An uncertain command is pending" | `session recover`. Never delete `state.json`, edit counters or create a new ID. |
 | Recovery fails after a new session or reboot | Replay is cached for only one response. Reconcile using the native app, install, ACL or content status, or the upload and audit records, before any new operation. |
 | PS+SELECT / "Agent stopped." | Stop. Keep pending effects and wait for the user. An old lease never resumes by itself. |
@@ -59,6 +61,21 @@ Large negative numbers are Sony codes, not these. Keep both the signed decimal a
 | Audit sync fails | Keep the mirror and its cursor, and retry into the same mirror. Never reset native journals. |
 | Service dead but Vita usable | One UDP diagnostics query, plus the runtime log if you can reach it. If nothing works, ask for a human-opened VitaShell FTP and do one transfer at a time. |
 | Vita hangs, crashes or reboots | Stop traffic, keep the dump, event and runtime evidence, and report it. No remote dumper exists. |
+
+## Replacing the trusted PC
+
+The plugin stores exactly one trusted PC certificate in `ur0:data/vita-agent-use/peer.der`. Different names are labels, not additional identities. There is no native multi-peer, unpair or physically approved replace command yet.
+
+To keep using the existing pairing on another PC, securely reuse the original PC identity/config directory (including certificate, private key and saved Vita pin). Update any absolute identity-file paths for the new PC. Stop the original server first: do not run two servers against the same identity or copy an unresolved effectful request and ignore it.
+
+To deliberately replace it with a new identity, the **human** must:
+
+1. Finish/cancel active runs, wait for any coredump to finalize, and stop the PC server. Reconcile uncertain effects before replacement.
+2. Using VitaShell locally, rename only `ur0:data/vita-agent-use/peer.der` to `peer.der.backup`, or remove only that file. This privileged trust reset is not available through agent filesystem commands.
+3. Reboot the Vita. Preserve `identity.bin`, ACLs, journals and the rest of the directory; do not wipe it.
+4. Provision the new PC if needed, run `session pair`, check the certificate fingerprint and physically approve OK on the Vita. Then start `serve`.
+
+The original PC will no longer authenticate after replacement. The Vita certificate stays the same. Existing ACL entries remain tied to their original PC certificate; they do not grant the new identity access. A preserved old peer/identity may regain its old ACLs if deliberately paired again.
 
 ## Safe diagnostics
 

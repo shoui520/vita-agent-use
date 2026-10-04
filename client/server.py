@@ -17,6 +17,7 @@ from pathlib import Path
 import queue
 import socket
 import socketserver
+import sys
 import threading
 import time
 import uuid
@@ -25,6 +26,18 @@ from vita_client import ClientError, NativeFrameError, VitaClient, durable_json,
 MAX_IPC = 1024 * 1024
 MAX_FRAME = 2 * 1024 * 1024
 TERMINAL = {'completed', 'cancelled', 'failed', 'connection_lost'}
+# Explicit observations and idempotent transport setup only. Never infer safety
+# from a method's spelling, and never replay writes/input/app control here.
+RETRYABLE_OPS = frozenset({
+    'capabilities', 'system.snapshot', 'app.running', 'app.list', 'fs.stat',
+    'fs.list', 'plugins.list', 'touch.panels', 'livearea.schema', 'livearea.layout',
+    'performance.read', 'events.read', 'dialog.events.read', 'input.status',
+    'run.status', 'acl.status', 'acl.audit', 'content.list', 'content.scope',
+    'content.albums', 'content.audit', 'content.delete.status',
+    'content.delete.changes', 'livearea.blob', 'app.install.status',
+    'screen.on', 'screen.off',
+    'events.subscribe',
+})
 
 
 def checked(reply):
@@ -353,10 +366,12 @@ class AgentServer:
         seen_path=self.root/'native-events.json'
         if seen_path.exists():
             self.native_order=[tuple(item) for item in private_json(seen_path)];self.native_seen=set(self.native_order)
+        self.last_activity=time.monotonic()
         self.runs=RunCoordinator(self)
     def event(self,event):
         result=self.store.append(event);self.runs.on_event(result);return result
     def receive(self,frame):
+        self.last_activity=time.monotonic()
         kind,result=frame['type'],frame['result'];run=frame.get('run_id')
         if kind in ('coredump.batch','dialog.batch'):
             dropped=result.get('dropped',0);previous=self.dropped_counts.get(kind,0);self.dropped_counts[kind]=dropped
@@ -391,45 +406,88 @@ class AgentServer:
             if reply.get('status')=='error':
                 self.reconnect_disabled=True
                 raise ClientError('Installed plugin rejected native push subscription; install the matching build. '+str(reply.get('error')))
-            checked(reply);self.connected=True;self.connection_error=None
+            checked(reply);self.connected=True;self.connection_error=None;self.last_activity=time.monotonic()
             self.event({'type':'connection.ready','transport':'persistent_tls_push'})
+    def _pending(self):
+        return private_json(self.options.state).get('pending') if self.options.state.exists() else None
+
+    def _session_status(self):
+        expires=getattr(self.client,'session_expires_at',None)
+        deadline=getattr(self.client,'session_deadline',None)
+        remaining=None if expires is None else max(0,deadline-time.monotonic() if deadline is not None else expires-time.time())
+        idle_remaining=max(0,30*60-(time.monotonic()-self.last_activity))
+        expired=remaining==0 or idle_remaining==0
+        return {'expires_at':expires,'expires_in_s':remaining,'idle_expires_in_s':idle_remaining,
+                'state':'expired' if expired else ('unknown' if expires is None else 'valid')}
+
+    def _renew_due(self):
+        session=self._session_status()
+        return (session['state']=='expired' or
+                (session['expires_in_s'] is not None and session['expires_in_s']<=60) or
+                time.monotonic()-self.last_activity>=29*60 or
+                (session['state']=='unknown' and isinstance(self.client,VitaClient) and getattr(self.options,'device_dir',None)))
+
+    def _new_session(self):
+        if self.reconnect_disabled or not getattr(self.options,'device_dir',None):
+            raise ClientError('Session renewal requires device_dir with its saved pairing identity.')
+        pending=self._pending()
+        if pending and pending.get('op') not in RETRYABLE_OPS:
+            raise ClientError('Uncertain pending command requires session recover.')
+        # Close the command channel first: the Vita only exposes the saved-peer
+        # listener after relinquishing the previous command connection.
+        self.connected=False;self.client.close()
+        # Give the native worker time to release the session listener.
+        time.sleep(1)
+        import pair_vita
+        pair_vita.BASE=self.options.device_dir.resolve()
+        with contextlib.redirect_stdout(__import__('sys').stderr):
+            creds=pair_vita.pair(resume=True,host=getattr(self.options,'vita_ip',None),agent_name=getattr(self.options,'agent_name',None),timeout=5)
+        # pair() archives the old state unchanged; effects are gated above.
+        self.client=ServerClient(creds,self.options.state,timeout=20,retry_disconnect=False,manage_screen=False,screen_off_when_done=False,event_sink=self.receive,disconnect_sink=self.disconnected)
+        self.client.command_ready_until=time.monotonic()+15
+        for watch_id in self.logs:
+            self.event({'type':'log.interrupted','watch_id':watch_id,'reason':'session renewed; re-register this listener'})
+        self.logs.clear();self.connect()
+        self.event({'type':'session.renewed'})
+
+    def _reconnect(self):
+        pending=self._pending()
+        if pending and pending.get('op') not in RETRYABLE_OPS:
+            raise ClientError('Uncertain pending command requires session recover.')
+        try:
+            if pending:self.client.recover()
+            self.connect()
+        except Exception:
+            self._new_session()
+
     def _supervise(self):
         backoff=2
         while not self.closing.wait(backoff):
             if self.reconnect_disabled:continue
             try:
                 with self.rpc_guard:
+                    # Do not interrupt a run, including dump finalization, to
+                    # renew authentication. Expiry is still visible in status.
+                    if self.runs.busy():continue
+                    if self.connected and self._renew_due():
+                        self._new_session()
                     while self.connected:
                         try:watch_id=self.control_queue.get_nowait()
                         except queue.Empty:break
                         checked(self.client.call('log.stop',{'watch_id':watch_id}));self.logs.pop(watch_id,None)
-                    if self.connected:backoff=2;continue
-                    if self.runs.busy() and self.runs.thread and self.runs.thread.is_alive():continue
-                    # An uncertain effectful command is never replayed as part
-                    # of reconnect. Preserve it for explicit agent recovery.
-                    pending=private_json(self.options.state).get('pending') if self.options.state.exists() else None
-                    if pending and pending.get('op')!='events.subscribe':
-                        self.connection_error='Uncertain pending command requires session recover.';backoff=60;continue
-                    try:
-                        if pending:self.client.recover()
-                        self.connect()
-                    except Exception:
-                        if self.reconnect_disabled or not self.options.device_dir:raise
-                        import pair_vita
-                        pair_vita.BASE=self.options.device_dir.resolve()
-                        with contextlib.redirect_stdout(__import__('sys').stderr):
-                            creds=pair_vita.pair(resume=True,host=self.options.vita_ip,agent_name=self.options.agent_name,timeout=5)
-                        self.client.close()
-                        self.client=ServerClient(creds,self.options.state,timeout=20,retry_disconnect=False,manage_screen=False,screen_off_when_done=False,event_sink=self.receive,disconnect_sink=self.disconnected)
-                        self.client.command_ready_until=time.monotonic()+15
-                        self.logs.clear();self.connect()
+                        self.last_activity=time.monotonic()
+                    if not self.connected:self._reconnect()
+                    backoff=2
             except Exception as exc:self.connection_error=str(exc);backoff=min(60,backoff*2)
 
     def dispatch(self,request):
         method=request.get('method');args=request.get('args',{})
         if not isinstance(args,dict):raise ClientError('Server arguments must be an object.')
-        if method=='server.status':return {'status':'ok','result':{'connected':self.connected,'connection_error':self.connection_error,'run':self.runs.status(),'latest_event':self.store.sequence,'socket':str(self.socket_path),'event_journal':str(self.store.path)}}
+        if method=='server.status':return {'status':'ok','result':{'connected':self.connected and self._session_status()['state']!='expired','session':self._session_status(),'connection_error':self.connection_error,'run':self.runs.status(),'latest_event':self.store.sequence,'socket':str(self.socket_path),'event_journal':str(self.store.path)}}
         if method=='events.read':return {'status':'ok','result':self.store.read(**args)}
+        if method not in ('run.status','run.cancel'):
+            with self.rpc_guard:
+                if self.connected and self._renew_due() and not self.runs.busy():self._new_session()
         if method=='run.start':return {'status':'ok','result':self.runs.start(args)}
         if method=='run.status':return {'status':'ok','result':self.runs.status()}
         if method=='run.cancel':return {'status':'ok','result':self.runs.cancel()}
@@ -458,10 +516,32 @@ class AgentServer:
             options=argparse.Namespace(**values)
             if self.runs.busy() and (options.group in ('app','input','touch','macro','config','content') or (options.group=='screen' and options.action!='capture') or (options.group=='fs' and options.action not in ('list','stat','download')) or options.group in ('call','session','performance')):raise ClientError('This command conflicts with the active run; status, events, metadata and captures remain available.')
             with self.rpc_guard:
-                if options.group!='screen' or options.action not in ('on','off'):checked(self.client.call('screen.on'))
-                try:return vita_agent.execute(options,self.client,emit_result=lambda event:self.event({'type':'command.progress','result':event}))
+                # Only repeat complete CLI operations that are observations;
+                # other commands retain exact-ID recovery even on disconnect.
+                observation=(options.group=='system' and options.action=='snapshot') or (options.group=='fs' and options.action in ('list','stat')) or (options.group=='app' and options.action in ('list','running'))
+                def execute():
+                    if options.group!='screen' or options.action not in ('on','off'):checked(self.client.call('screen.on'))
+                    result=vita_agent.execute(options,self.client,emit_result=lambda event:self.event({'type':'command.progress','result':event}))
+                    self.last_activity=time.monotonic()
+                    return result
+                try:
+                    try:return execute()
+                    except (OSError,ClientError):
+                        pending=self._pending()
+                        if not observation or not pending or pending.get('op') not in RETRYABLE_OPS or self.runs.busy():raise
+                        self._new_session()
+                        return execute()
                 finally:
-                    if self.screen_off_when_done and not self.runs.busy() and getattr(options,'op',None)!='system.reboot' and not (options.group=='screen' and options.action in ('on','off')):checked(self.client.call('screen.off'))
+                    failed=sys.exc_info()[0] is not None
+                    # Preserve the primary failure and any pending request;
+                    # local validation errors still get normal screen cleanup.
+                    cleanup=self.screen_off_when_done and not self.runs.busy() and getattr(options,'op',None)!='system.reboot' and not (options.group=='screen' and options.action in ('on','off'))
+                    if cleanup and (not failed or (self.connected and self._pending() is None)):
+                        try:
+                            checked(self.client.call('screen.off'));self.last_activity=time.monotonic()
+                        except Exception as exc:
+                            if not failed:raise
+                            self.event({'type':'command.cleanup_failed','message':str(exc)})
         raise ClientError('Unknown server method.')
     @property
     def socket_path(self):return self.root/'server.sock'

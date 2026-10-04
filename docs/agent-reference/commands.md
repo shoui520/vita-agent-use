@@ -13,6 +13,8 @@ This covers every CLI command. For syntax, run `python3 client/vita_agent.py <gr
 - **session connect**: gets a fresh token from the saved pairing on 8847, sending the current name and IP. If a server is already connected, use the server instead; its session may have 8847 closed.
 - **session recover**: replays the exact pending command ID and body; clears pending state only when a matching reply arrives. With nothing pending, it returns the last response. If the Vita's replay record is gone, check the operation's own status or audit; never retry with a new effect.
 
+Pairing accepts one trusted PC identity at a time. A second identity requires a human peer reset; see [recovery.md](recovery.md#replacing-the-trusted-pc). Different `agent_name` values can reuse the existing identity with `session connect`.
+
 ## app
 
 - **app list** `[--query] [--limit --page]`: complete installed-title list from the Shell registry (not a scan of `ux0:app`). Never merge pages from failed attempts.

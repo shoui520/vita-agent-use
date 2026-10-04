@@ -11,7 +11,7 @@ python3 client/vita_agent.py server watch-log ux0:data/my-app/log.txt --literal 
 python3 client/vita_agent.py server performance-start --seconds 60 --interval-ms 1000
 ```
 
-`--wait` waits on the PC's own event history; it does not poll the Vita. The Vita pushes events over the server's existing connection, so nothing extra listens on the network. The Unix socket is only for local CLI calls. Reconnects back off from 2 to 60 s, and an uncertain command pauses automatic reconnection until it is recovered.
+`--wait` waits on the PC's own event history; it does not poll the Vita. The Vita pushes events over the server's existing connection, so nothing extra listens on the network. The Unix socket is only for local CLI calls. Reconnects back off from 2 to 60 s. An uncertain write or control command pauses automatic reconnection until it is recovered; read-only observations do not. With `device_dir` configured, sessions renew before the one-hour expiry or idle limit. `server status` includes expiry and reports expired sessions as disconnected. Legacy credentials without a recorded expiry are renewed once when the saved pairing directory is available. Renewal is deferred during runs and dump finalization. Renewal interrupts standalone log listeners and emits `log.interrupted`; re-register them.
 
 | Event | Meaning |
 |---|---|

@@ -86,6 +86,7 @@ def pair_locked(resume=False, *, host=None, agent_name=None, timeout=75):
     context.set_ciphers('ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256')
     context.load_cert_chain(config['client_certificate'],config['client_key'])
     connection=http.client.HTTPSConnection(config['host'],config['port'],context=context,timeout=timeout)
+    started_at=time.time()
     try:
         connection.connect()
         pin=hashlib.sha256(connection.sock.getpeercert(binary_form=True)).hexdigest()
@@ -108,7 +109,8 @@ def pair_locked(resume=False, *, host=None, agent_name=None, timeout=75):
             config['certificate_sha256']=pin
             durable_json(BASE/'pc/pairing.json',config)
         credentials={k:config[k] for k in ('host','agent_name','certificate_sha256','client_certificate','client_key')}
-        credentials.update(port=result['command_port'],token=token)
+        # Start before the exchange so the host deadline is conservative.
+        credentials.update(port=result['command_port'],token=token,session_expires_at=started_at+3600)
         durable_json(BASE/'pc/credentials.json',credentials)
         state=BASE/'pc/state.json'
         if state.exists():
@@ -121,6 +123,16 @@ def pair_locked(resume=False, *, host=None, agent_name=None, timeout=75):
                 os.close(fd); os.replace(state,backup)
         print('Session accepted.' if resume else 'Pairing accepted.', 'Credentials saved privately; command endpoint port',result['command_port'])
         return credentials
+    except ssl.SSLError as exc:
+        if getattr(exc,'reason',None)=='TLSV1_ALERT_UNKNOWN_CA' or 'TLSV1_ALERT_UNKNOWN_CA' in str(exc):
+            raise ClientError(
+                'Vita rejected this PC certificate (TLS unknown CA). The plugin trusts only one PC identity; '
+                'it may already be paired with another PC. Reuse that PC identity, or have the user replace '
+                'the saved peer via VitaShell as described in docs/agent-reference/recovery.md. '
+                'No approval prompt can appear for a different identity while a peer is saved. '
+                'The trusted peer name/fingerprint is unavailable from this rejected handshake.'
+            ) from exc
+        raise
     finally: connection.close()
 
 def wait_for_commands(credentials,timeout=15,*,screen_off_when_done=True):
