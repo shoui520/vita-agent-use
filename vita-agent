@@ -1,0 +1,5 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Locate the client without changing the caller's working directory.
+launcher_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 1
+exec python3 "$launcher_dir/client/vita_agent.py" "$@"
