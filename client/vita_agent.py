@@ -11,7 +11,7 @@ import threading
 import time
 import uuid
 
-from vita_client import ClientError, NativeFrameError, VitaClient, private_json, strict_json, validate_host, validate_agent_name
+from vita_client import ClientError, NativeFrameError, UploadError, VitaClient, private_json, strict_json, validate_host, validate_agent_name
 
 CONFIG_PATH = Path("config.json")
 
@@ -212,7 +212,7 @@ def execute(a,c,emit_result=emit):
     if g=='fs':
         if action=='download':return c.download(a.path,a.output)
         from upload import upload
-        return upload(c,a.source,a.destination,a.transfer_state,a.overwrite,a.expected_sha256,a.yes)
+        return upload(c,a.source,a.destination,a.transfer_state,a.overwrite,a.expected_sha256,a.yes,progress=emit_result)
     if g in ('macro','touch','input'):
         from macro_runner import MacroRunner
         runner=MacroRunner(c,a.macro_store or a.state.parent/'macros')
@@ -406,7 +406,7 @@ def main(argv=None):
                 if isinstance(value,Path) and str(value)!='-':values[key]=str(value.resolve())
             if any(str(getattr(a,key,None))=='-' for key in ('file',)):
                 raise ClientError('Use a JSON file when submitting commands to the PC server.')
-            r=server.request(a,'execute',values)
+            r=server.request(a,'execute',values,emit_progress=emit)
             if r is not None:emit(r)
             return 1 if r is not None and (r.get('status') in ('error','client_error','unconfirmed') or r.get('code',0) or r.get('state')=='failed' or r.get('result',{}).get('state')=='failed') else 0
         client=VitaClient(private_json(a.credentials),a.state,timeout=20,screen_off_when_done=a.screen_off_when_done,**connection_options(a))
@@ -421,6 +421,8 @@ def main(argv=None):
             return 1 if r.get('status') in ('error','client_error','unconfirmed') or r.get('code',0) or r.get('state')=='failed' or r.get('result',{}).get('state')=='failed' else 0
         return 0
     except KeyboardInterrupt:return 130
+    except UploadError as e:
+        emit(e.as_result());return 1
     except NativeFrameError as e:
         emit(e.as_result());return 1
     except (ClientError,OSError,ValueError,TypeError) as e:

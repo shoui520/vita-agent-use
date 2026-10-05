@@ -18,6 +18,7 @@ struct vau_connection {
     uint64_t started_us,phase_us,last_us,generation;
     unsigned requests,close_after_response,file_response,audit_response,upload_response;
     uint64_t file_offset,push_due_us;
+    uint64_t upload_open_us,upload_work_us,upload_close_us;
     char push_token[65];
     unsigned push_slot,push_response,push_burst;
     int (*reboot)(void *);

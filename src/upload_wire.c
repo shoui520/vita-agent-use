@@ -1,6 +1,9 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include "upload_wire.h"
 #include "json.h"
+#include "protocol.h"
+_Static_assert(4u+VAU_UPLOAD_METADATA_BYTES+VAU_UPLOAD_CHUNK_BYTES<=VAU_REQUEST_BYTES,
+    "Upload envelope must fit the existing HTTP body buffer");
 #include "format.h"
 #include <string.h>
 static int hex(const char *s,size_t length)

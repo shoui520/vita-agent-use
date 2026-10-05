@@ -151,7 +151,7 @@ int vau_upload_chunk(struct vau_upload_context *c,const struct vau_write_request
     if(!out)return VAU_INVALID;
     memset(out,0,sizeof(*out));
     int rc=gate(c,r);if(rc)return rc;
-    if(!data || !bytes || bytes>VAU_FILE_READ_BYTES || offset>r->bytes || bytes>r->bytes-offset)return VAU_INVALID;
+    if(!data || !bytes || bytes>VAU_UPLOAD_CHUNK_BYTES || offset>r->bytes || bytes>r->bytes-offset)return VAU_INVALID;
     rc=state(c,r);if(rc)return rc;
     char stage[VAU_PATH_MAX];rc=vau_upload_stage_path(r,stage);if(rc)return rc;
     struct vau_file_info before;rc=stat_regular(stage,&before);if(rc)return rc;
@@ -160,20 +160,30 @@ int vau_upload_chunk(struct vau_upload_context *c,const struct vau_write_request
     SceOff position=sceIoLseek(fd,(SceOff)offset,SCE_SEEK_SET);
     if(position<0 || (uint64_t)position!=offset){sceIoClose(fd);return position<0 ? (int)position:VAU_DEVICE_ERROR;}
     uint64_t old=before.bytes-offset;uint32_t overlap=old<bytes ? (uint32_t)old:bytes,at=0;
-    unsigned char *buffer=overlap ? vauPafMalloc(overlap):NULL;
-    if(overlap && !buffer){sceIoClose(fd);return VAU_DEVICE_ERROR;}
-    while(at<overlap) {int got=sceIoRead(fd,buffer+at,overlap-at);if(got<0){rc=got;break;}if(!got || (unsigned)got>overlap-at){rc=VAU_STALE;break;}at+=(unsigned)got;}
-    if(!rc && overlap && memcmp(buffer,data,overlap))rc=VAU_STALE;
+    unsigned scratch=overlap<VAU_FILE_READ_BYTES ? overlap:VAU_FILE_READ_BYTES;
+    unsigned char *buffer=scratch ? vauPafMalloc(scratch):NULL;
+    if(scratch && !buffer){sceIoClose(fd);return VAU_DEVICE_ERROR;}
+    while(at<overlap) {
+        if(c->stopped(c->context)){rc=VAU_DENIED;break;}
+        unsigned wanted=overlap-at;if(wanted>scratch)wanted=scratch;
+        int got=sceIoRead(fd,buffer,wanted);
+        if(got<0){rc=got;break;}
+        if(!got || (unsigned)got>wanted){rc=VAU_STALE;break;}
+        if(memcmp(buffer,(const unsigned char *)data+at,(size_t)got)){rc=VAU_STALE;break;}
+        at+=(unsigned)got;
+    }
     if(buffer)vauPafFree(buffer);
-    if(!rc && overlap<bytes)rc=audit(c,r,"stage_chunk_intent",offset,0);
+    /* PREPARE/stage_create durably bind the whole private upload before
+     * chunks are accepted. Audit logical staging at begin/verify, rather
+     * than creating two SQLite FULL-sync transactions per wire packet. */
     while(!rc && at<bytes) {
         if(c->stopped(c->context)){rc=VAU_DENIED;break;}
-        int written=sceIoWrite(fd,(const unsigned char *)data+at,bytes-at);
-        if(written<0)rc=written;else if(!written || (unsigned)written>bytes-at)rc=VAU_DEVICE_ERROR;else at+=(unsigned)written;
+        unsigned wanted=bytes-at;if(wanted>VAU_FILE_READ_BYTES)wanted=VAU_FILE_READ_BYTES;
+        int written=sceIoWrite(fd,(const unsigned char *)data+at,wanted);
+        if(written<0)rc=written;else if(!written || (unsigned)written>wanted)rc=VAU_DEVICE_ERROR;else at+=(unsigned)written;
     }
     if(!rc)rc=sceIoSyncByFd(fd,0);
     int closed=sceIoClose(fd);if(!rc && closed<0)rc=closed;
-    if(!rc)rc=audit(c,r,overlap<bytes ? "stage_chunk":"stage_chunk_replay",offset+bytes,1);
     if(rc)return rc<0 ? rc:VAU_DEVICE_ERROR;
     out->received=before.bytes>offset+bytes ? before.bytes:offset+bytes;return VAU_OK;
 }

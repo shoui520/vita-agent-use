@@ -30,6 +30,24 @@ class ClientError(Exception):
     pass
 
 
+class UploadError(ClientError):
+    """Upload failure with confirmed progress, never an inferred remote outcome."""
+    def __init__(self, message, progress):
+        self.progress = dict(progress)
+        received = progress.get('received')
+        count = 'unknown' if received is None else received
+        total = progress.get('bytes') or 'unknown'
+        super().__init__(f"Upload failed during {progress.get('phase', 'unknown')}: {message}. "
+                         f"Confirmed bytes: {count}/{total}. "
+                         'Rerun the identical command with the same --transfer-state file to resume; '
+                         'do not change the source or operation ID.')
+
+    def as_result(self):
+        return {'status':'client_error','message':str(self),'result':self.progress,
+                'resume':{'transfer_state':self.progress.get('transfer_state'),
+                          'instruction':'Rerun the identical command with the same transfer state and source.'}}
+
+
 def validate_agent_name(name):
     if not isinstance(name, str) or not name.strip() or any(ord(c) < 32 or 0x7f <= ord(c) <= 0x9f or 0xd800 <= ord(c) <= 0xdfff or 0x2028 <= ord(c) <= 0x202e or 0x2066 <= ord(c) <= 0x2069 for c in name) or len(name.encode('utf-8')) > 128:
         raise ClientError('Agent name must be a single-line UTF-8 label of at most 128 bytes.')
@@ -161,6 +179,7 @@ class VitaClient:
         self.session_deadline = None if self.session_expires_at is None else time.monotonic()+max(0,self.session_expires_at-time.time())
         self.timeout = timeout
         self._connection = None
+        self._upload_chunk_bytes = None
         self.path = Path(state_path)
         self.identity = hashlib.sha256(json.dumps({k: v for k, v in credentials.items() if k not in ('agent_name', 'session_expires_at')}, sort_keys=True).encode()).hexdigest()
 
@@ -633,6 +652,18 @@ class VitaClient:
                 self._close_transport()
                 raise
 
+    def upload_chunk_size(self):
+        """Negotiate once per client; old plugins retain their 12 KiB limit."""
+        if self._upload_chunk_bytes is None:
+            reply=self.call('capabilities')
+            if reply.get('status')!='ok':raise ClientError('Cannot query upload capabilities.')
+            upload=reply.get('result',{}).get('upload',{})
+            limit=upload.get('chunk_bytes_max',12288)
+            if type(limit) is not int or not 1<=limit<=122880:
+                raise ClientError('Invalid advertised upload chunk limit.')
+            self._upload_chunk_bytes=limit
+        return self._upload_chunk_bytes
+
     def upload_step(self, request, action, offset=0, data=b''):
         """One sequential upload step; workflow must persist request first."""
         fields = {'operation_id', 'path', 'bytes', 'sha256', 'expected_sha256', 'overwrite', 'yes'}
@@ -644,8 +675,10 @@ class VitaClient:
             raise ClientError('Invalid upload size or overwrite flag.')
         if not isinstance(request['sha256'], str) or not re.fullmatch('[0-9a-f]{64}', request['sha256']) or not isinstance(request['expected_sha256'], str) or not re.fullmatch('(?:[0-9a-f]{64})?' if request['overwrite'] else '', request['expected_sha256']):
             raise ClientError('Invalid upload content digest.')
-        if type(offset) is not int or offset < 0 or not isinstance(data, bytes) or len(data) > 12288:
+        if type(offset) is not int or offset < 0 or not isinstance(data, bytes) or len(data) > 122880:
             raise ClientError('Invalid upload chunk.')
+        if len(data)>12288 and len(data)>self.upload_chunk_size():
+            raise ClientError('Upload chunk exceeds the installed plugin limit.')
         if action == 'chunk':
             if not data or offset + len(data) > int(request['bytes']):raise ClientError('Chunk is outside the upload.')
         elif offset or data:
@@ -684,13 +717,19 @@ class VitaClient:
                 for key in ('received', 'sequence'):
                     if not isinstance(result[key], str) or not re.fullmatch('0|[1-9][0-9]{0,18}', result[key]) or int(result[key]) > 2**63-1:
                         raise ClientError('Invalid upload progress.')
+                timing_headers={name:response.headers.get_all('X-Vita-Upload-'+header,[]) for name,header in
+                                (('journal_open','Journal-Open-Us'),('work','Work-Us'),('journal_close','Journal-Close-Us'))}
+                if any(timing_headers.values()):
+                    if any(len(values)!=1 or not re.fullmatch('0|[1-9][0-9]{0,19}',values[0]) or int(values[0])>2**64-1 for values in timing_headers.values()):
+                        raise ClientError('Invalid upload timings.')
+                    result['timings_us']={name:values[0] for name,values in timing_headers.items()}
                 if int(result['received']) > int(request['bytes']) or any(type(result[k]) is not bool for k in ('verified', 'complete', 'effect_started', 'readback_required')):
                     raise ClientError('Invalid upload flags or progress.')
                 if response.will_close:self._close_transport()
                 return result
-            except (OSError, http.client.HTTPException, ValueError):
+            except (OSError, http.client.HTTPException, ValueError) as exc:
                 self._close_transport()
-                raise ClientError('Upload transport failed; resume using the saved transfer state.') from None
+                raise ClientError('Upload transport failed (%s: %s); resume using the saved transfer state.' % (type(exc).__name__,str(exc) or type(exc).__name__)) from exc
             except BaseException:
                 self._close_transport()
                 raise

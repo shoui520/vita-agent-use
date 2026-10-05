@@ -21,8 +21,9 @@ import sys
 import threading
 import time
 import uuid
-from vita_client import ClientError, NativeFrameError, VitaClient, durable_json, private_json, strict_json
+from vita_client import ClientError, NativeFrameError, UploadError, VitaClient, durable_json, private_json, strict_json
 
+IPC_IDLE_TIMEOUT = 65
 MAX_IPC = 1024 * 1024
 MAX_FRAME = 2 * 1024 * 1024
 TERMINAL = {'completed', 'cancelled', 'failed', 'connection_lost'}
@@ -480,7 +481,7 @@ class AgentServer:
                     backoff=2
             except Exception as exc:self.connection_error=str(exc);backoff=min(60,backoff*2)
 
-    def dispatch(self,request):
+    def dispatch(self,request,progress=None):
         method=request.get('method');args=request.get('args',{})
         if not isinstance(args,dict):raise ClientError('Server arguments must be an object.')
         if method=='server.status':return {'status':'ok','result':{'connected':self.connected and self._session_status()['state']!='expired','session':self._session_status(),'connection_error':self.connection_error,'run':self.runs.status(),'latest_event':self.store.sequence,'socket':str(self.socket_path),'event_journal':str(self.store.path)}}
@@ -519,9 +520,12 @@ class AgentServer:
                 # Only repeat complete CLI operations that are observations;
                 # other commands retain exact-ID recovery even on disconnect.
                 observation=(options.group=='system' and options.action=='snapshot') or (options.group=='fs' and options.action in ('list','stat')) or (options.group=='app' and options.action in ('list','running'))
+                def command_progress(event):
+                    self.event({'type':'command.progress','result':event})
+                    if progress is not None and event.get('status')=='progress':progress(event)
                 def execute():
                     if options.group!='screen' or options.action not in ('on','off'):checked(self.client.call('screen.on'))
-                    result=vita_agent.execute(options,self.client,emit_result=lambda event:self.event({'type':'command.progress','result':event}))
+                    result=vita_agent.execute(options,self.client,emit_result=command_progress)
                     self.last_activity=time.monotonic()
                     return result
                 try:
@@ -554,16 +558,19 @@ class AgentServer:
         server=self
         class Handler(socketserver.StreamRequestHandler):
             def handle(self):
-                self.request.settimeout(65)
+                self.request.settimeout(IPC_IDLE_TIMEOUT)
+                def send(result):
+                    encoded=json.dumps(result,ensure_ascii=False,separators=(',',':')).encode()+b'\n'
+                    if len(encoded)>MAX_IPC:encoded=b'{"status":"client_error","message":"IPC reply exceeds 1 MiB; request a limit."}\n'
+                    with contextlib.suppress(OSError):
+                        self.wfile.write(encoded);self.wfile.flush()
                 try:
                     raw=self.rfile.readline(MAX_IPC+1)
                     if len(raw)>MAX_IPC or not raw.endswith(b'\n'):raise ClientError('IPC request exceeds limit or lacks framing.')
-                    result=server.dispatch(strict_json(raw))
-                except NativeFrameError as exc:result=exc.as_result()
+                    result=server.dispatch(strict_json(raw),progress=send)
+                except (NativeFrameError,UploadError) as exc:result=exc.as_result()
                 except Exception as exc:result={'status':'client_error','message':str(exc)}
-                encoded=json.dumps(result,ensure_ascii=False,separators=(',',':')).encode()+b'\n'
-                if len(encoded)>MAX_IPC:encoded=b'{"status":"client_error","message":"IPC reply exceeds 1 MiB; request a limit."}\n'
-                with contextlib.suppress(OSError):self.wfile.write(encoded)
+                send(result)
         class Listener(socketserver.ThreadingUnixStreamServer):
             daemon_threads=True
         with contextlib.suppress(FileNotFoundError):path.unlink()
@@ -586,15 +593,32 @@ class AgentServer:
             os.close(lock)
 
 
-def request(options,method,args=None):
+def request(options,method,args=None,*,emit_progress=None):
     path=options.state.parent/'server/server.sock'
     payload=json.dumps({'method':method,'args':args or {}},default=lambda x:str(x) if isinstance(x,Path) else x,ensure_ascii=False,separators=(',',':')).encode()+b'\n'
     if len(payload)>MAX_IPC:raise ClientError('Server request exceeds 1 MiB.')
-    with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as sock:
-        sock.settimeout(65);sock.connect(str(path));sock.sendall(payload)
-        with sock.makefile('rb') as stream:raw=stream.readline(MAX_IPC+1)
-    if len(raw)>MAX_IPC or not raw.endswith(b'\n'):raise ClientError('Incomplete or oversized PC server reply.')
-    return strict_json(raw)
+    latest=None
+    if method=='execute' and args and args.get('group')=='fs' and args.get('action')=='upload':
+        latest={'type':'upload','phase':'waiting_for_server','received':None,'bytes':None,
+                'operation_id':None,'path':args.get('destination'),'transfer_state':str(args.get('transfer_state'))}
+    try:
+        with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as sock:
+            sock.settimeout(IPC_IDLE_TIMEOUT);sock.connect(str(path));sock.sendall(payload)
+            with sock.makefile('rb') as stream:
+                while True:
+                    raw=stream.readline(MAX_IPC+1)
+                    if len(raw)>MAX_IPC or not raw.endswith(b'\n'):raise ClientError('Incomplete or oversized PC server reply.')
+                    reply=strict_json(raw)
+                    if not isinstance(reply,dict):raise ClientError('Invalid PC server reply.')
+                    if reply.get('status')!='progress':return reply
+                    latest=reply.get('result')
+                    if not isinstance(latest,dict):raise ClientError('Invalid PC server progress.')
+                    if emit_progress is not None:emit_progress(reply)
+    except (TimeoutError,OSError) as exc:
+        if latest is not None and latest.get('type')=='upload':
+            raise UploadError('PC server progress stopped: '+(str(exc) or type(exc).__name__)+
+                              '; the server may still be transferring. Wait for it to finish before resuming',latest) from exc
+        raise
 
 
 def running(options):return (options.state.parent/'server/server.sock').exists()

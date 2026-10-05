@@ -84,7 +84,7 @@ The Vita enforces policy; no CLI flag can override an immutable rule.
 - Input timing runs on the Vita; never drive button transitions with network timing or host sleeps.
 - During an active run: `server status`, `server events`, `run status`, captures, metadata and read-only filesystem calls work. App, input, touch, macro, config, content (including its read-only queries), `call`, session, performance, filesystem-write and explicit screen commands are rejected.
 - Blocking commands (`input submit`, `touch swipe`, `macro run`, foreground watchers and waits) hold the server's command lock. Other RPCs queue behind them; do not promise screenshots during a macro.
-- Local IPC waits at most 65 s and carries at most 1 MiB per message. A server job can keep running after the CLI times out; check status before resubmitting. For long work, prefer `run start`, `server performance-start` and `app install --no-wait`.
+- Local IPC allows 65 s of silence and carries at most 1 MiB per message. Uploads stream progress, so their total duration can exceed 65 s. A server job can keep running after the CLI times out; check status before resubmitting. For long work, prefer `run start`, `server performance-start` and `app install --no-wait`.
 - Low-level manual control with `call macro.acquire`, heartbeats and `macro.enqueue` is possible, but requires disciplined lease handling (see call-schemas.md).
 
 ## Workspace

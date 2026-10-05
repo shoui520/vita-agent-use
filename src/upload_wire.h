@@ -3,7 +3,6 @@
 #define VAU_UPLOAD_WIRE_H
 #include "staged_upload.h"
 #define VAU_UPLOAD_METADATA_BYTES 3072u
-#define VAU_UPLOAD_CHUNK_BYTES 12288u
 enum vau_upload_action {VAU_UPLOAD_BEGIN,VAU_UPLOAD_CHUNK,VAU_UPLOAD_VERIFY,VAU_UPLOAD_COMMIT,VAU_UPLOAD_RECOVER};
 struct vau_upload_message {
     struct vau_write_request request;

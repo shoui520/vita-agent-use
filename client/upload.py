@@ -8,8 +8,9 @@ import os
 import re
 from pathlib import Path
 import stat
+import time
 import uuid
-from vita_client import VitaClient, ClientError, private_json, durable_json
+from vita_client import VitaClient, ClientError, UploadError, private_json, durable_json
 
 
 def checked(result, allow_readback=False):
@@ -20,7 +21,7 @@ def checked(result, allow_readback=False):
     return result
 
 
-def upload(client, source, destination, transfer_state, overwrite=False, expected_sha256='', yes=False, *, config_readback=None):
+def upload(client, source, destination, transfer_state, overwrite=False, expected_sha256='', yes=False, *, config_readback=None, progress=None):
     VitaClient._command('fs.mkdir', {'operation_id':'0'*32,'path':destination,'yes':yes})
     if type(overwrite) is not bool or not isinstance(expected_sha256, str) or not re.fullmatch('(?:[0-9a-f]{64})?' if overwrite else '', expected_sha256):
         raise ClientError('Invalid optional original SHA256.')
@@ -36,10 +37,31 @@ def upload(client, source, destination, transfer_state, overwrite=False, expecte
     def complete(result):
         if config_readback is not None:
             if not result['readback_required']:raise ClientError('Vita did not require config readback.')
+            info['phase']='readback';report(force=True)
             return {**result, 'readback': config_readback()}
         return result
     source = Path(source).absolute()
     transfer_state = Path(transfer_state).absolute()
+    info={'type':'upload','path':destination,'transfer_state':str(transfer_state),
+          'phase':'prepare','action':None,'received':None,'bytes':None,'operation_id':None}
+    last_report=0
+    def report(force=False):
+        nonlocal last_report
+        now=time.monotonic()
+        if progress is not None and (force or now-last_report>=1):
+            progress({'status':'progress','result':dict(info)});last_report=now
+    def step(request, action, offset=0, data=b''):
+        phase='transfer' if action in ('begin','chunk') else action
+        changed=info['phase']!=phase
+        info.update(phase=phase,action=action)
+        if changed:report(force=True)
+        started=time.monotonic()
+        result=client.upload_step(request,action,offset,data)
+        info['last_step_ms']=round((time.monotonic()-started)*1000,3)
+        if 'timings_us' in result:info['last_step_native_us']=dict(result['timings_us'])
+        if result['code']==0:info['received']=result['received']
+        report()
+        return result
     lock_fd = os.open(str(transfer_state) + '.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
         lock_info = os.fstat(lock_fd)
@@ -50,8 +72,10 @@ def upload(client, source, destination, transfer_state, overwrite=False, expecte
         with os.fdopen(fd, 'rb') as stream:
             before = os.fstat(stream.fileno())
             if not stat.S_ISREG(before.st_mode):raise ClientError('Upload source must be a regular file.')
+            info['bytes']=str(before.st_size);info['phase']='hash';report(force=True)
             digest = hashlib.sha256()
-            while block := stream.read(65536):digest.update(block)
+            while block := stream.read(65536):
+                digest.update(block);report()
             signature = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
             def unchanged():
                 now = os.fstat(stream.fileno())
@@ -69,9 +93,10 @@ def upload(client, source, destination, transfer_state, overwrite=False, expecte
                          'request': {**base, 'operation_id': uuid.uuid4().hex}, 'phase': 'transfer'}
                 durable_json(transfer_state, saved)
             request = saved['request']
+            info.update(operation_id=request['operation_id'],phase=saved['phase']);report(force=True)
             if saved['phase'] in ('commit', 'done'):
                 # Query the bound completion first after a lost commit reply.
-                result = client.upload_step(request, 'recover')
+                result = step(request, 'recover')
                 if result['code'] == 0 and result['complete']:
                     check(result);result = complete(result);saved['phase'] = 'done';durable_json(transfer_state, saved)
                     return result
@@ -81,28 +106,33 @@ def upload(client, source, destination, transfer_state, overwrite=False, expecte
                     check(result) # A recovered original is a failed operation, never a new upload.
                 # No commit intent was recorded: verify/commit the staged bytes
                 # with the same operation identity; never generate another ID.
-                unchanged();verified = check(client.upload_step(request, 'verify'))
+                unchanged();verified = check(step(request, 'verify'))
                 if not verified['verified']:raise ClientError('Vita did not verify the upload.')
             else:
-                result = check(client.upload_step(request, 'begin'))
+                result = check(step(request, 'begin'))
                 if result['complete']:
                     result = complete(result);saved['phase'] = 'done';durable_json(transfer_state, saved);return result
+                chunk_bytes=client.upload_chunk_size() if hasattr(client,'upload_chunk_size') else 12288
+                if type(chunk_bytes) is not int or not 1<=chunk_bytes<=122880:raise ClientError('Invalid upload chunk limit.')
                 offset = int(result['received']);stream.seek(offset)
                 while offset < before.st_size:
-                    unchanged();block = stream.read(min(12288, before.st_size-offset))
+                    unchanged();block = stream.read(min(chunk_bytes, before.st_size-offset))
                     if not block:raise ClientError('Upload source truncated; commit was withheld.')
-                    result = check(client.upload_step(request, 'chunk', offset, block))
+                    result = check(step(request, 'chunk', offset, block))
                     next_offset = int(result['received'])
                     if next_offset != offset + len(block):raise ClientError('Unexpected upload offset; resume from the saved operation.')
                     offset = next_offset
-                unchanged();result = check(client.upload_step(request, 'verify'))
+                unchanged();result = check(step(request, 'verify'))
                 if not result['verified']:raise ClientError('Vita did not verify the upload.')
                 saved['phase'] = 'commit';durable_json(transfer_state, saved)
-            unchanged();result = check(client.upload_step(request, 'commit'))
+            unchanged();result = check(step(request, 'commit'))
             if not result['complete']:raise ClientError('Vita has not confirmed durable upload completion.')
             result = complete(result)
             saved['phase'] = 'done';durable_json(transfer_state, saved)
             return result
+    except (ClientError,OSError) as exc:
+        if info['operation_id'] is None:raise
+        raise UploadError(str(exc),info) from exc
     finally:
         os.close(lock_fd)
 

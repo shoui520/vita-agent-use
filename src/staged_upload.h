@@ -2,6 +2,8 @@
 #ifndef VAU_STAGED_UPLOAD_H
 #define VAU_STAGED_UPLOAD_H
 #include "write_journal.h"
+/* Fits the existing 128 KiB HTTP body buffer including upload metadata. */
+#define VAU_UPLOAD_CHUNK_BYTES 122880u
 struct vau_upload_context {
     const struct vau_file_policy *policy;
     struct vau_write_journal *journal;
@@ -13,7 +15,10 @@ struct vau_upload_context {
      * and explicit readback. Missing callback disables config commit. */
     int (*config_replace)(struct vau_upload_context *,const struct vau_write_request *,const char *stage,unsigned *started);
 };
-struct vau_upload_status { uint64_t received;unsigned verified; };
+struct vau_upload_status {
+    uint64_t received;unsigned verified;
+    uint64_t journal_open_us,work_us,journal_close_us;
+};
 /* Internal native adapter: no stage path is accepted from the peer. The
  * authenticated dispatcher must supply the immutable peer identity. */
 int vau_upload_config_replace(struct vau_upload_context *,const struct vau_write_request *,const char *,unsigned *);

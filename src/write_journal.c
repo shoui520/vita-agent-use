@@ -148,6 +148,10 @@ int vau_journal_open_readonly(struct vau_write_journal *j,const char *path)
 #endif
     )); /* READONLY; never CREATE */
     if(rc){if(db)sqlite3_close(db);return rc;}
+    /* Keep observational/chunk lookups within the same bounded page cache
+     * as writable handles. These pragmas change connection-local state only. */
+    rc=exec(db,"PRAGMA cache_size=32;PRAGMA temp_store=MEMORY");
+    if(rc){sqlite3_close(db);return rc;}
     sqlite3_stmt *s=NULL;uint64_t version=0;
     rc=prepare(db,"PRAGMA user_version",&s);
     if(!rc){int step=sqlite3_step(s);rc=step==100 ? integer(s,0,3,&version):error(step);}

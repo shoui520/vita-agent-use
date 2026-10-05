@@ -47,7 +47,7 @@ Large negative numbers are Sony codes, not these. Keep both the signed decimal a
 | ACL pending or denied | Wait for the physical decision and query the same ID. Only `approved` grants access. |
 | Write denied despite ACL | Check the immutable and core-plugin rules, the private storage and tai-root rules, which tai directory is active, narrower denies, and `--yes`. |
 | Original-hash mismatch | The target changed. Keep the old plan and make a fresh one; never force it. |
-| Interrupted upload | Rerun exactly the same command with the same state file, source, config and flags. Never change the source mid-upload. |
+| Interrupted upload | Read the error’s `result` for phase/action, last confirmed `received` bytes, total bytes, operation ID and transfer-state path. Unacknowledged bytes may also exist on the Vita; resume queries its confirmed offset. Rerun exactly the same command with the same state file, source, config and flags. Never change the source mid-upload. |
 | Config guard or prerequisite failure | Leave the config alone. Check the host guard, protected lines, which tai directory is active and the recovery VitaShell. |
 | Config readback failed | Unacknowledged. Rerun `apply` with the same plan and state; never reboot until it is verified. |
 | `effect_started` but uncertain | Inspect both paths and the audit. A deletion may have partly succeeded. Never replay with a new ID or assume a rollback happened. |

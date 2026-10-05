@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include "format.h"
 #include "protocol.h"
+#include "upload_wire.h"
 #include "json.h"
 #include "input_sequence.h"
 #include "sha256.h"
@@ -636,14 +637,14 @@ static int request_locked(struct vau_session *s, const struct vau_native_api *ap
             "\"plugins\":{\"page_entries_max\":2,\"source\":\"native_module_lists\",\"categories\":\"taihen_config_sections\"},"
             "\"filesystem\":{\"page_entries_max\":8,\"offset_max\":4294967295,\"scan_reads_max\":128,\"continuation_idle_us\":30000000,\"snapshot\":false,\"read_path\":\"/v1/file/read\",\"read_bytes_max\":16384},"
             "\"audit\":{\"export_path\":\"/v1/audit\",\"page_events_max\":2,\"response_bytes_max\":16384},"
-            "\"upload\":{\"path\":\"/v1/file/upload\",\"metadata_bytes_max\":3072,\"chunk_bytes_max\":12288,\"encoding\":\"be32_json_length_json_raw\"},"
+            "\"upload\":{\"path\":\"/v1/file/upload\",\"metadata_bytes_max\":3072,\"chunk_bytes_max\":%u,\"encoding\":\"be32_json_length_json_raw\"},"
             "\"input\":{\"events_max\":1024,\"duration_us_max\":3600000000,\"repeats_max\":1000000,"
             "\"lease_us\":5000000,\"button_mask\":62457,\"start_clock\":\"device_monotonic_us\",\"start_delay_us_min\":10000,\"start_delay_us_max\":1000000,"
             "\"process_binding\":false,\"routing\":\"native_current_target\","
             "\"touch_submission\":true,\"readable_events\":true,\"same_timestamp_disjoint_merge\":true,\"front_contacts_max\":6,\"back_contacts_max\":4,\"touch_fields\":[\"enabled\",\"front\",\"back\"],"
             "\"contact_fields\":[\"id\",\"force\",\"x\",\"y\"],"
             "\"event_fields\":[\"at_us\",\"buttons\",\"lx\",\"ly\",\"rx\",\"ry\"],"
-            "\"applied_means\":\"native_api_accepted\"},\"macros\":{\"acquire\":\"macro.acquire\",\"binding\":\"title_id\"},\"performance\":{\"measure\":\"performance.measure\",\"watch\":\"performance.watch\",\"read\":\"performance.read\",\"cancel\":\"performance.cancel\",\"window_ms_min\":100,\"window_ms_max\":60000,\"watch_seconds_max\":3600,\"sample_interval_ms\":1000,\"retained_samples\":64,\"core_order\":[\"CPU0\",\"CPU1\",\"CPU2\",\"CPU3\"]}}}",id);
+            "\"applied_means\":\"native_api_accepted\"},\"macros\":{\"acquire\":\"macro.acquire\",\"binding\":\"title_id\"},\"performance\":{\"measure\":\"performance.measure\",\"watch\":\"performance.watch\",\"read\":\"performance.read\",\"cancel\":\"performance.cancel\",\"window_ms_min\":100,\"window_ms_max\":60000,\"watch_seconds_max\":3600,\"sample_interval_ms\":1000,\"retained_samples\":64,\"core_order\":[\"CPU0\",\"CPU1\",\"CPU2\",\"CPU3\"]}}}",id,VAU_UPLOAD_CHUNK_BYTES);
     } else if(command->operation==OP_SUBSCRIBE) {
         char result[3500];
         int got=api->events ? api->events(api->context,0,0,result,sizeof(result)):VAU_UNSUPPORTED;

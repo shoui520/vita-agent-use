@@ -140,6 +140,8 @@ static int upload_file(struct vau_connection *c,struct vau_service *s,const stru
                 rc=api->file_upload ? api->file_upload(api->context,&message,&progress,&record):VAU_UNSUPPORTED;
                 /* Application errors are a completed HTTP exchange; reconnect
                  * is unnecessary and operation identity makes retries durable. */
+                c->upload_open_us=progress.journal_open_us;
+                c->upload_work_us=progress.work_us;c->upload_close_us=progress.journal_close_us;
                 c->upload_response=1;*status=200;return vau_upload_wire_reply(&message,rc,&progress,&record,output,capacity);
             }
         }
@@ -305,6 +307,18 @@ int vau_connection_feed(struct vau_connection *c, struct vau_service *s,
     if (header<0) {
         vau_connection_close(c);
         return header;
+    }
+    if(c->upload_response) {
+        /* Optional headers preserve the JSON wire contract for old clients. */
+        int extra=vau_snprintf(c->output+header-2,VAU_CONNECTION_HEADER_BYTES-(size_t)header+2,
+            "X-Vita-Upload-Journal-Open-Us: %" PRIu64 "\r\n"
+            "X-Vita-Upload-Work-Us: %" PRIu64 "\r\n"
+            "X-Vita-Upload-Journal-Close-Us: %" PRIu64 "\r\n\r\n",
+            c->upload_open_us,c->upload_work_us,c->upload_close_us);
+        if(extra<0 || (size_t)extra>=VAU_CONNECTION_HEADER_BYTES-(size_t)header+2) {
+            vau_connection_close(c);return VAU_DEVICE_ERROR;
+        }
+        header=header-2+extra;
     }
     memmove(c->output+header,c->output+VAU_CONNECTION_HEADER_BYTES,(size_t)body);
     c->output_size=(size_t)header+(size_t)body;

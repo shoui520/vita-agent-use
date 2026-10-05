@@ -60,7 +60,7 @@ static int refresh_policy(void)
     if(!rc)rc=vau_acl_config_parse(json,used,policy.active_tai,&policy);
     vauPafFree(json);return rc;
 }
-static int open_journal(const struct vau_write_request *request,struct vau_write_journal *journal,int recover)
+static int open_journal(const struct vau_write_request *request,struct vau_write_journal *journal,int recover,int readonly)
 {
     if(!owner || !request || stopped(owner))return VAU_DENIED;
     int rc=refresh_policy();if(rc)return rc;
@@ -74,10 +74,10 @@ static int open_journal(const struct vau_write_request *request,struct vau_write
     if(info.kind!=VAU_FILE_DIRECTORY)return VAU_DENIED;
     const char *path="ur0:data/vita-agent-use/write-audit.db";
     rc=vau_vita_file_stat(NULL,path,&info);
-    if(rc && (recover || rc!=VAU_IO_ENOENT))return rc;
+    if(rc && (recover || readonly || rc!=VAU_IO_ENOENT))return rc;
     if(!rc && info.kind!=VAU_FILE_REGULAR)return VAU_DENIED;
     if(stopped(owner))return VAU_DENIED;
-    return vau_journal_open(journal,path);
+    return readonly ? vau_journal_open_readonly(journal,path):vau_journal_open(journal,path);
 }
 int vau_vita_file_mutate(void *context,const struct vau_write_request *request,struct vau_write_record *out)
 {
@@ -87,7 +87,7 @@ int vau_vita_file_mutate(void *context,const struct vau_write_request *request,s
     if(vau_vita_content_busy())return VAU_BUSY;
     if(request->operation!=VAU_FS_MKDIR && request->operation!=VAU_FS_RENAME_SOURCE && request->operation!=VAU_FS_TRASH && request->operation!=VAU_FS_PURGE)return VAU_UNSUPPORTED;
     int reset=vau_vita_file_list_reset();if(reset<0)return reset;
-    struct vau_write_journal journal={0};int rc=open_journal(request,&journal,0);if(rc)return rc;
+    struct vau_write_journal journal={0};int rc=open_journal(request,&journal,0,0);if(rc)return rc;
     struct vau_upload_context upload={.policy=&policy,.journal=&journal,.context=owner,.stopped=stopped,.clock=clock_us};
     rc=vau_mutation_execute(&upload,request,out);
     int closed=vau_journal_close(&journal);return closed ? closed:rc;
@@ -101,7 +101,11 @@ int vau_vita_file_upload(void *context,const struct vau_upload_message *m,struct
     int reset=vau_vita_file_list_reset();if(reset<0)return reset;
     const struct vau_write_request *r=&m->request;
     if(r->operation!=VAU_FS_WRITE)return VAU_INVALID;
-    struct vau_write_journal journal={0};int rc=open_journal(r,&journal,m->action==VAU_UPLOAD_RECOVER);if(rc)return rc;
+    uint64_t begin=clock_us(NULL);
+    struct vau_write_journal journal={0};
+    int rc=open_journal(r,&journal,m->action==VAU_UPLOAD_RECOVER,m->action==VAU_UPLOAD_CHUNK);
+    uint64_t opened=clock_us(NULL);
+    if(rc){status->journal_open_us=opened>=begin ? opened-begin:0;return rc;}
     struct vau_upload_context upload={.policy=&policy,.journal=&journal,.context=owner,.stopped=stopped,.clock=clock_us,
         .config_check=vau_config_native_preflight,.config_replace=vau_upload_config_replace};
     rc=vau_journal_state(&journal,r->subject,r->id,out);
@@ -115,7 +119,13 @@ int vau_vita_file_upload(void *context,const struct vau_upload_message *m,struct
         else rc=vau_upload_recover(&upload,r,out);
     }
     if(!rc && out->phase==VAU_WRITE_COMPLETE && out->sequence){status->received=r->bytes;status->verified=1;}
-    int closed=vau_journal_close(&journal);return closed ? closed:rc;
+    uint64_t worked=clock_us(NULL);
+    int closed=vau_journal_close(&journal);
+    uint64_t ended=clock_us(NULL);
+    status->journal_open_us=opened>=begin ? opened-begin:0;
+    status->work_us=worked>=opened ? worked-opened:0;
+    status->journal_close_us=ended>=worked ? ended-worked:0;
+    return closed ? closed:rc;
 }
 
 int vau_vita_acl_load(struct vau_file_policy *out)
