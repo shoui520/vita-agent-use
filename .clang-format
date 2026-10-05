@@ -1,0 +1,48 @@
+# Kernel style, tuned for readability. Indent with tabs (shown 4 wide).
+Language: Cpp
+BasedOnStyle: LLVM
+UseTab: ForIndentation
+IndentWidth: 4
+TabWidth: 4
+ContinuationIndentWidth: 8
+ColumnLimit: 100
+
+BreakBeforeBraces: Linux
+IndentCaseLabels: false
+IndentGotoLabels: false
+SpaceBeforeParens: ControlStatements
+PointerAlignment: Right
+Cpp11BracedListStyle: false
+
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortBlocksOnASingleLine: Never
+AllowShortCaseLabelsOnASingleLine: true
+AllowShortEnumsOnASingleLine: false
+AlwaysBreakAfterReturnType: None
+BinPackArguments: true
+BinPackParameters: true
+AlignAfterOpenBracket: Align
+BreakBeforeBinaryOperators: None
+BreakStringLiterals: false
+
+AlignConsecutiveMacros: Consecutive
+AlignConsecutiveAssignments:
+  Enabled: true
+  AcrossEmptyLines: false
+  AcrossComments: false
+  AlignCompound: false
+  PadOperators: true
+AlignEscapedNewlines: Left
+AlignTrailingComments: true
+AlignOperands: Align
+
+SeparateDefinitionBlocks: Always
+MaxEmptyLinesToKeep: 1
+KeepEmptyLinesAtTheStartOfBlocks: false
+InsertNewlineAtEOF: true
+
+SortIncludes: Never
+IncludeBlocks: Preserve
+ReflowComments: true

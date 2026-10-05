@@ -20,3 +20,5 @@ Before changing behavior, read both the host wrapper and the native code path. K
 | Diagnostics, loader, build | `client/diagnose_vita.py`; `src/diagnostics_vita.c`, `shell_loader.c`; `CMakeLists.txt`, `native365.yml` |
 
 Conventions: keep the kernel bridge small and heavy work on the PC. Bound every native allocation and queue, release borrowed JPEG and file resources, and keep startup and cleanup non-blocking. Prefer audited native code paths. Firmware-specific hooks must fail with evidence when unsupported, never by guessing addresses. Never add a hardware test that could damage protected paths.
+
+C style: kernel style with tab indents, as defined by `.clang-format`. Run `clang-format -i` on changed C files, and separate logical steps with blank lines: after declarations, after guard clauses, and between blocks.

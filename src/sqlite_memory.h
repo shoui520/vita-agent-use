@@ -1,5 +1,11 @@
-/* SPDX-License-Identifier: GPL-3.0-or-later */
+/*
+ * Copyright (C) 2026 shoui520
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
 #ifndef VAU_SQLITE_MEMORY_H
 #define VAU_SQLITE_MEMORY_H
+
 int vau_sqlite_memory_configure(void);
+
 #endif
