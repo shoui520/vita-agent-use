@@ -9,6 +9,8 @@ void vau_http_init_pairing(struct vau_http_request *r)
 { vau_http_init(r); r->pairing_only=1; r->close_connection=1; }
 void vau_http_init_session(struct vau_http_request *r)
 { vau_http_init(r); r->pairing_only=2; r->close_connection=1; }
+void vau_http_init_admission(struct vau_http_request *r)
+{ vau_http_init(r); r->pairing_only=3; r->close_connection=1; }
 static enum vau_http_state fail(struct vau_http_request *r, unsigned status)
 {
     r->state=VAU_HTTP_ERROR;
@@ -41,7 +43,13 @@ static unsigned headers(struct vau_http_request *r)
     static const char pair[]="POST /v1/pair HTTP/1.1\r\n";
     static const char session[]="POST /v1/session HTTP/1.1\r\n";
     size_t pos;
-    if (r->pairing_only==2) {
+    if (r->pairing_only==3) {
+        if (r->header_bytes>=sizeof(session)+1 && !memcmp(r->data,session,sizeof(session)-1)) {
+            r->pairing_only=2; pos=sizeof(session)-1;
+        } else if (r->header_bytes>=sizeof(pair)+1 && !memcmp(r->data,pair,sizeof(pair)-1)) {
+            r->pairing_only=1; pos=sizeof(pair)-1;
+        } else return 400;
+    } else if (r->pairing_only==2) {
         if (r->header_bytes<sizeof(session)+1 || memcmp(r->data,session,sizeof(session)-1)) return 400;
         pos=sizeof(session)-1;
     } else if (r->pairing_only) {

@@ -45,6 +45,13 @@ int vau_pairing_ui_begin(struct vau_pairing_ui *ui,const struct vau_pairing_bind
 {
     struct vau_pairing_prompt prompt;
     int rc=vau_pairing_prompt_format(&prompt,name,length,binding ? binding->certificate_sha256 : NULL);
+    if(rc>=0 && binding && binding->replace_peer) {
+        static const char suffix[]="\n\nThis replaces the previously paired computer.";
+        size_t extra=sizeof(suffix)-1;
+        if(prompt.length+extra>=VAU_PAIRING_TEXT_UNITS) return VAU_INVALID;
+        for(size_t i=0;i<extra;i++) prompt.text[prompt.length++]=(unsigned char)suffix[i];
+        prompt.text[prompt.length]=0;
+    }
     return rc<0 ? rc : vau_pairing_ui_begin_prompt(ui,binding,&prompt,now);
 }
 int vau_pairing_ui_begin_prompt(struct vau_pairing_ui *ui,const struct vau_pairing_binding *binding,
@@ -83,7 +90,7 @@ void vau_pairing_ui_cancel(struct vau_pairing_ui *ui)
 }
 static int same_binding(const struct vau_pairing_binding *a,const struct vau_pairing_binding *b)
 {
-    return b && a->connection==b->connection &&
+    return b && a->replace_peer==b->replace_peer && a->connection==b->connection &&
         a->local_stop_generation==b->local_stop_generation &&
         a->kernel_stop_generation==b->kernel_stop_generation &&
         !memcmp(a->certificate_sha256,b->certificate_sha256,32);

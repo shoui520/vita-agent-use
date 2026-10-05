@@ -3,7 +3,7 @@
 #include <string.h>
 static int matches(const struct vau_pairing_binding *a,const struct vau_pairing_binding *b)
 {
-    return b && a->connection==b->connection && a->local_stop_generation==b->local_stop_generation &&
+    return b && a->connection==b->connection && a->replace_peer==b->replace_peer && a->local_stop_generation==b->local_stop_generation &&
         a->kernel_stop_generation==b->kernel_stop_generation &&
         !memcmp(a->certificate_sha256,b->certificate_sha256,32);
 }

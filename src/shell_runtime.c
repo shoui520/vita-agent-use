@@ -166,11 +166,22 @@ static int store_peer(void)
         int n=sceIoWrite(fd,network.pairing.certificate+written,network.pairing.certificate_size-written);
         if(n<=0) { rc=n<0 ? n : VAU_DEVICE_ERROR; break; } written+=(size_t)n;
     }
+    if(rc>=0) rc=sceIoSyncByFd(fd,0);
     int closed=sceIoClose(fd); if(closed<0) rc=closed;
-    if(rc>=0) {
-        SceIoStat existing={0};
-        if(sceIoGetstat(ROOT "peer.der",&existing)>=0) rc=sceIoRemove(ROOT "peer.der");
-        if(rc>=0) rc=sceIoRename(ROOT "peer.der.tmp",ROOT "peer.der");
+    int retained=0;
+    if(rc>=0 && peer_size) {
+        /* Keep the approved old peer until the replacement has been installed.
+         * Startup restores it if power is lost between these two renames. */
+        SceIoStat previous={0};
+        int exists=sceIoGetstat(ROOT "peer.previous.der",&previous);
+        if(exists>=0) rc=sceIoRemove(ROOT "peer.previous.der");
+        else if((uint32_t)exists!=UINT32_C(0x80010002)) rc=exists;
+        if(rc>=0) { rc=sceIoRename(ROOT "peer.der",ROOT "peer.previous.der"); retained=rc>=0; }
+    }
+    if(rc>=0) rc=sceIoRename(ROOT "peer.der.tmp",ROOT "peer.der");
+    if(rc<0 && retained) {
+        int restored=sceIoRename(ROOT "peer.previous.der",ROOT "peer.der");
+        if(restored<0) log_event("previous peer restore failed",restored,0);
     }
     if(rc>=0) { peer_size=network.pairing.certificate_size; memcpy(peer,network.pairing.certificate,peer_size); }
     return rc;
@@ -201,11 +212,11 @@ static int token_reply(const struct vau_pairing_grant *grant)
     const struct vau_grant_reply_io io={&server.channel,NULL,reply_clock,reply_wait};
     return vau_grant_reply(&service,grant,COMMAND_PORT,&io);
 }
-static int pair_once(int trusted)
+static int pair_once(void)
 {
-    int rc=trusted ? vau_tls_server_init(&server,(struct vau_tls_der){certificate,certificate_size},
-        (struct vau_tls_der){key,key_size},(struct vau_tls_der){peer,peer_size},vau_vita_entropy,NULL,fatal_crypto) :
-        vau_tls_server_init_pairing(&server,(struct vau_tls_der){certificate,certificate_size},
+    /* Admission proves certificate possession but grants no trust. Sessions
+     * require exact saved-certificate equality; pairing requires native OK. */
+    int rc=vau_tls_server_init_pairing(&server,(struct vau_tls_der){certificate,certificate_size},
         (struct vau_tls_der){key,key_size},vau_vita_entropy,NULL,fatal_crypto);
     if(rc<0) return rc;
     vau_net_socket_init(&listener); vau_net_socket_init(&client); vau_net_waiter_init(&waiter);
@@ -232,22 +243,24 @@ static int pair_once(int trusted)
         if(rc<0) goto done;
         mbedtls_ssl_set_bio(&server.channel,&client,vau_net_send,vau_net_recv,NULL);
         ++connection_id;
-        rc=trusted ? vau_session_tls_init(&network.pairing,&server,&service,connection_id,now_us()) :
-            vau_pairing_tls_init(&network.pairing,&server,&service,connection_id,now_us());
-        if(rc>=0 && !trusted) rc=vau_pairing_flow_init(&flow,&network.pairing,&ui);
+        rc=vau_vita_wake(NULL);
+        if(rc>=0) rc=vau_pairing_tls_init(&network.pairing,&server,&service,connection_id,now_us());
+        if(rc>=0) vau_http_init_admission(&network.pairing.http);
         if(rc<0) { report("pairing start",rc); goto attempt_failed; }
-        if(trusted) {
-            while(!network.pairing.request_ready && network.pairing.work!=VAU_TLS_CLOSED) {
-                if(network.pairing.work==VAU_TLS_WAIT_READ || network.pairing.work==VAU_TLS_WAIT_WRITE) {
-                    int ready=vau_net_wait(&waiter,&client,network.pairing.work==VAU_TLS_WAIT_WRITE,16000);
-                    if(ready<0) { vau_pairing_tls_close(&network.pairing,ready); break; }
-                }
-                (void)vau_pairing_tls_request_step(&network.pairing,&service,now_us());
+        while(!network.pairing.request_ready && network.pairing.work!=VAU_TLS_CLOSED) {
+            if(network.pairing.work==VAU_TLS_WAIT_READ || network.pairing.work==VAU_TLS_WAIT_WRITE) {
+                int ready=vau_net_wait(&waiter,&client,network.pairing.work==VAU_TLS_WAIT_WRITE,16000);
+                if(ready<0) { vau_pairing_tls_close(&network.pairing,ready); break; }
             }
-            rc=network.pairing.work==VAU_TLS_CLOSED ? network.pairing.error : VAU_OK;
-            if(rc>=0 && (!network.pairing.ready || !network.pairing.trusted ||
-                mbedtls_ssl_get_verify_result(&server.channel) ||
-                mbedtls_ct_memcmp(network.pairing.binding.certificate_sha256,server.peer_fingerprint,32))) rc=VAU_DENIED;
+            (void)vau_pairing_tls_request_step(&network.pairing,&service,now_us());
+        }
+        rc=network.pairing.work==VAU_TLS_CLOSED ? network.pairing.error : VAU_OK;
+        if(rc<0) { report("pairing request rejected",rc); goto attempt_failed; }
+        if(network.pairing.http.pairing_only==2) {
+            /* A session request never creates a prompt or changes peer trust. */
+            if(!peer_size || network.pairing.certificate_size!=peer_size ||
+                mbedtls_ct_memcmp(network.pairing.certificate,peer,peer_size)) rc=VAU_DENIED;
+            if(rc>=0) memcpy(server.peer_fingerprint,network.pairing.binding.certificate_sha256,32);
             if(rc>=0) rc=vau_vita_wake(NULL);
             if(rc>=0) rc=vau_vita_session_activate(&service,&network.pairing.binding,server.peer_fingerprint,
                 notifications.started ? &notifications : NULL,network.pairing.request.name,
@@ -264,6 +277,11 @@ static int pair_once(int trusted)
             vau_pairing_tls_close(&network.pairing,rc);
             goto attempt_failed;
         }
+        network.pairing.binding.replace_peer=peer_size &&
+            (network.pairing.certificate_size!=peer_size ||
+             mbedtls_ct_memcmp(network.pairing.certificate,peer,peer_size));
+        rc=vau_pairing_flow_init(&flow,&network.pairing,&ui);
+        if(rc<0) goto attempt_failed;
         do {
             if(network.pairing.work==VAU_TLS_WAIT_READ || network.pairing.work==VAU_TLS_WAIT_WRITE) {
                 int ready=vau_net_wait(&waiter,&client,network.pairing.work==VAU_TLS_WAIT_WRITE,16000);
@@ -315,8 +333,13 @@ static int runtime_thread(SceSize args,void *argp)
     rc=load_identity();
     if(rc<0) { report("identity files",rc); return 0; }
     rc=read_der(ROOT "peer.der",peer,&peer_size);
-    /* Only absent trust permits first network.pairing. Read/corruption errors must not
-     * reopen pairing to arbitrary LAN clients or overwrite approved identity. */
+    if((uint32_t)rc==UINT32_C(0x80010002)) {
+        int previous=read_der(ROOT "peer.previous.der",peer,&peer_size);
+        if(previous>=0) rc=sceIoRename(ROOT "peer.previous.der",ROOT "peer.der");
+        else if((uint32_t)previous!=UINT32_C(0x80010002)) rc=previous;
+    }
+    /* Corrupt trust is a recovery error. New peer approval is explicit and
+     * never silently discards unreadable saved trust. */
     if(rc<0 && (uint32_t)rc!=UINT32_C(0x80010002)) {
         report("saved peer invalid",rc); return 0;
     }
@@ -330,7 +353,7 @@ static int runtime_thread(SceSize args,void *argp)
     }
     vau_pairing_worker_init(&ui,&service,&vau_vita_native_api,rc>=0 ? &notifications : NULL);
     for(;;) {
-        rc=pair_once(peer_size!=0);
+        rc=pair_once();
         if(rc>=0) rc=vau_tls_server_init(&server,(struct vau_tls_der){certificate,certificate_size},
             (struct vau_tls_der){key,key_size},(struct vau_tls_der){peer,peer_size},vau_vita_entropy,NULL,fatal_crypto);
         if(rc>=0) {

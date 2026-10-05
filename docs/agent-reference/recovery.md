@@ -55,7 +55,7 @@ Large negative numbers are Sony codes, not these. Keep both the signed decimal a
 | Run failed with `coredump` | Check the path, the terminal state and `cleanup_errors`. This can be a correct result. |
 | Log literal never arrives | The watch started at the end of the file. Check the exact bytes, the path, whether the app launched and flushed its log, and reset, connection or overflow events. Never match an old line. |
 | Metrics null, wrong process or dropped | Keep the error, foreground-process and window evidence; never invent values. |
-| IPC timeout after 65 s | The job may still be running. Check events and status before resubmitting. Prefer the asynchronous interfaces. |
+| IPC timeout after 65 s of silence | Upload progress resets this inactivity limit; total upload duration is not capped at 65 s. The job may still be running. Check events and status before resubmitting. Prefer the asynchronous interfaces. |
 | IPC reply over 1 MiB | Use `--limit` and handle `has_more` (`livearea layout` needs `--section` first). Say the result is limited. |
 | Event `lost` or overflow | Report the gap and check the journal. Events lost on the Vita cannot be recovered. |
 | Audit sync fails | Keep the mirror and its cursor, and retry into the same mirror. Never reset native journals. |
@@ -64,16 +64,14 @@ Large negative numbers are Sony codes, not these. Keep both the signed decimal a
 
 ## Replacing the trusted PC
 
-The plugin stores exactly one trusted PC certificate in `ur0:data/vita-agent-use/peer.der`. Different names are labels, not additional identities. There is no native multi-peer, unpair or physically approved replace command yet.
+The plugin stores one trusted PC certificate in `ur0:data/vita-agent-use/peer.der`. Different agent names can share that identity. A fresh identity can replace it using the normal pairing command and physical approval; no file copying or VitaShell trust reset is needed.
 
-To keep using the existing pairing on another PC, securely reuse the original PC identity/config directory (including certificate, private key and saved Vita pin). Update any absolute identity-file paths for the new PC. Stop the original server first: do not run two servers against the same identity or copy an unresolved effectful request and ignore it.
+1. Finish/cancel active runs, wait for any coredump to finalize, and stop the current PC server. Reconcile uncertain effects before replacement. Stopping `serve` does not necessarily end the Vita-side session. If pairing is refused and diagnostics reports `commands listening`, reboot the Vita with the old server stopped before attempting the new pairing. While the command session remains active, the pairing port is closed.
+2. Run `./vita-agent --config <your-config.json> session pair` from the new configuration. It creates the PC identity if needed.
+3. Check the fingerprint and tap OK on the Vita. For a different saved peer, the dialog explicitly says this replaces the previously paired computer. Cancel or timeout keeps the old peer.
+4. Start `serve` using the same config. Its `device_dir` is ordinary private PC storage; no particular directory name or pre-existing test files are required.
 
-To deliberately replace it with a new identity, the **human** must:
-
-1. Finish/cancel active runs, wait for any coredump to finalize, and stop the PC server. Reconcile uncertain effects before replacement.
-2. Using VitaShell locally, rename only `ur0:data/vita-agent-use/peer.der` to `peer.der.backup`, or remove only that file. This privileged trust reset is not available through agent filesystem commands.
-3. Reboot the Vita. Preserve `identity.bin`, ACLs, journals and the rest of the directory; do not wipe it.
-4. Provision the new PC if needed, run `session pair`, check the certificate fingerprint and physically approve OK on the Vita. Then start `serve`.
+The Vita retains the previous peer while installing the approved replacement and restores it on startup if replacement was interrupted before installation. Unreadable saved trust is reported as a recovery error, not silently reset.
 
 The original PC will no longer authenticate after replacement. The Vita certificate stays the same. Existing ACL entries remain tied to their original PC certificate; they do not grant the new identity access. A preserved old peer/identity may regain its old ACLs if deliberately paired again.
 

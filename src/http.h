@@ -28,6 +28,9 @@ void vau_http_init(struct vau_http_request *request);
 void vau_http_init_pairing(struct vau_http_request *request);
 /* Saved-peer TLS owner only: POST /v1/session; cannot accept /v1/pair. */
 void vau_http_init_session(struct vau_http_request *request);
+/* Quarantined admission: accepts pair or session, never commands. Owner must
+ * check the exact saved certificate before granting an automatic session. */
+void vau_http_init_admission(struct vau_http_request *request);
 /* One POST /v1/command, /v1/frame, /v1/file/read, /v1/file/upload or /v1/audit at a time. No chunking or pipelining. After sending the
  * complete response, the transport may reinitialize this parser for the next
  * request on the same authenticated connection. Honor close_connection and

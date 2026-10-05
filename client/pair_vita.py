@@ -127,9 +127,8 @@ def pair_locked(resume=False, *, host=None, agent_name=None, timeout=75):
         if getattr(exc,'reason',None)=='TLSV1_ALERT_UNKNOWN_CA' or 'TLSV1_ALERT_UNKNOWN_CA' in str(exc):
             raise ClientError(
                 'Vita rejected this PC certificate (TLS unknown CA). The plugin trusts only one PC identity; '
-                'it may already be paired with another PC. Reuse that PC identity, or have the user replace '
-                'the saved peer via VitaShell as described in docs/agent-reference/recovery.md. '
-                'No approval prompt can appear for a different identity while a peer is saved. '
+                'The installed plugin may predate native replacement pairing. Update the Shell plugin '
+                'to request replacement with physical OK; see docs/agent-reference/recovery.md. '
                 'The trusted peer name/fingerprint is unavailable from this rejected handshake.'
             ) from exc
         raise

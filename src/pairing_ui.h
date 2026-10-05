@@ -7,6 +7,7 @@ struct vau_pairing_binding {
     /* Connection IDs must be local, unique, nonzero, and never reused. */
     uint64_t connection,local_stop_generation,kernel_stop_generation;
     unsigned char certificate_sha256[32];
+    unsigned replace_peer; /* Local UI intent; never supplied by the peer. */
 };
 enum vau_pairing_ui_state { VAU_PAIR_UI_IDLE, VAU_PAIR_UI_ACTIVE, VAU_PAIR_UI_DONE };
 struct vau_pairing_ui {
