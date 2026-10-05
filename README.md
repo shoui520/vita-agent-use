@@ -78,11 +78,14 @@ pip install cryptography
 python3 client/vita_agent.py bootstrap
 ```
 
-`bootstrap` is an interactive setup wizard. It asks for your Vita's IP address and the name of the agent that will use it. It reads your `config.txt` over VitaShell FTP to check for incompatible plugins, but never writes anything to the Vita.
+`bootstrap` is an interactive setup wizard. It asks for a directory to hold `config.json` and the private `pc/` identity, your Vita's IP address, and the agent's name. It reads your `config.txt` over VitaShell FTP to check for incompatible plugins, but never writes anything to the Vita.
+
+When setup finishes, run the `export VITA_AGENT_CONFIG_DIR=...` command it prints. The variable points to the chosen **directory**, not the JSON file. Set it in your agent's launch environment too, or add the export to your shell startup file to retain it across terminals. Commands always read `$VITA_AGENT_CONFIG_DIR/config.json`; there is no `--config` flag or automatic search in the current directory. Existing setups can use their existing directory without creating a new identity.
 
 ### 4. Pair
 
 ```sh
+export VITA_AGENT_CONFIG_DIR="/absolute/path/chosen-in-bootstrap"
 python3 client/vita_agent.py session pair   # tap OK on the Vita
 python3 client/vita_agent.py serve          # optional: leave running for live events
 ```

@@ -13,17 +13,14 @@ import uuid
 
 from vita_client import ClientError, NativeFrameError, UploadError, VitaClient, private_json, strict_json, validate_host, validate_agent_name
 
-CONFIG_PATH = Path("config.json")
+CONFIG_ENV = "VITA_AGENT_CONFIG_DIR"
 
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--config', type=Path, help='Config file; defaults to config.json in the current working directory.')
-    p.add_argument('--device-dir', type=Path, help='Device directory containing pc/credentials.json and pc/state.json.')
-    p.add_argument('--credentials', type=Path)
-    p.add_argument('--state', type=Path)
+    p.epilog = 'Set VITA_AGENT_CONFIG_DIR to the directory chosen in bootstrap (containing config.json and pc/).'
     p.add_argument('--macro-store', type=Path)
-    p.set_defaults(screen_off_when_done=True, vita_ip=None, agent_name=None)
+    p.set_defaults(screen_off_when_done=True, vita_ip=None, agent_name=None, device_dir=None, credentials=None, state=None)
     groups = p.add_subparsers(dest='group', required=True)
     groups.add_parser('bootstrap', help='Human TUI for configuration, plugin compatibility checks and PC identity setup.')
     def group(name, help):
@@ -286,25 +283,24 @@ def execute(a,c,emit_result=emit):
 
 
 
-def selected_config(options):
-    return (getattr(options, 'config', None) or CONFIG_PATH).expanduser().resolve()
+def selected_config():
+    value = os.environ.get(CONFIG_ENV)
+    if not value or not value.strip() or '\0' in value:
+        raise ClientError('Set VITA_AGENT_CONFIG_DIR to the directory chosen in bootstrap (containing config.json and pc/).')
+    folder = Path(value).expanduser()
+    if not folder.is_absolute():
+        raise ClientError('VITA_AGENT_CONFIG_DIR must be an absolute directory path.')
+    if not folder.is_dir():
+        raise ClientError('VITA_AGENT_CONFIG_DIR is not an existing directory: ' + str(folder))
+    return folder.resolve() / 'config.json'
 
 
 def load_config(options):
-    """Read the selected config; paths inside it are relative to that file."""
-    explicit_connection = options.device_dir or (options.credentials and options.state)
-    config_path = selected_config(options)
+    """Read config.json from the directory selected only by the environment."""
+    config_path = selected_config()
     if not config_path.exists():
-        if explicit_connection and not getattr(options, 'config', None):return
-        raise ClientError('Missing client config: ' + str(config_path) + '. Run bootstrap or pass --config.')
+        raise ClientError('Missing client config: ' + str(config_path) + '. Run bootstrap and export VITA_AGENT_CONFIG_DIR to its chosen directory.')
     config = private_json(config_path)
-    if isinstance(config, dict) and set(config) == {'config_file'}:
-        value = config['config_file']
-        if not isinstance(value, str) or not value or '\0' in value:
-            raise ClientError('config_file must be a nonempty path.')
-        target = Path(value).expanduser()
-        config_path = target if target.is_absolute() else (config_path.parent/target).resolve()
-        config = private_json(config_path)
     keys = {'device_dir', 'credentials', 'state', 'macro_store', 'screen_off_when_done', 'vita_ip', 'agent_name'}
     if not isinstance(config, dict) or not config or set(config) - keys:
         raise ClientError('Client config must contain device_dir or credentials/state paths.')
@@ -319,7 +315,6 @@ def load_config(options):
             continue
         if not isinstance(value, str) or not value or '\0' in value:
             raise ClientError('Client config paths must be nonempty strings.')
-        if explicit_connection and key in ('device_dir','credentials','state'):continue
         if getattr(options, key) is None:
             path = Path(value).expanduser()
             setattr(options, key, path if path.is_absolute() else (config_path.parent / path).resolve())
@@ -343,7 +338,7 @@ def main(argv=None):
     try:
         if a.group=='bootstrap':
             from bootstrap import run
-            run(selected_config(a));return 0
+            run();return 0
         if not (a.group=='diagnostics' and a.host):load_config(a)
         if a.device_dir:
             a.credentials=a.credentials or a.device_dir/'pc/credentials.json'
@@ -354,7 +349,7 @@ def main(argv=None):
             if not host:p.error('diagnostics requires --host or credentials')
             emit(query(host,input_sample=a.action=='input',logging=a.action=='log'));return 0
         if a.group=='session' and a.action in ('provision','pair','connect'):
-            if not a.device_dir:p.error('session setup requires --device-dir')
+            if not a.device_dir:p.error('session setup requires device_dir in config.json')
             import pair_vita
             pair_vita.BASE=a.device_dir.resolve()
             with contextlib.redirect_stdout(sys.stderr):

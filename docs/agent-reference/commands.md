@@ -4,7 +4,7 @@ This covers every CLI command. For syntax, run `python3 client/vita_agent.py <gr
 
 ## system / session
 
-- **bootstrap**: human-only TUI; see AGENTS.md. If FTP fails, the human fixes the IP or VitaShell FTP and retries inside the TUI. Escape cancels.
+- **bootstrap**: human-only TUI; see AGENTS.md. Chooses the directory containing config.json and pc/, then prints `export VITA_AGENT_CONFIG_DIR=...`; run that export or set the variable in the agent launch environment. No config argument is accepted. If FTP fails, the human fixes the IP or VitaShell FTP and retries inside the TUI. Escape cancels.
 - **system snapshot**: foreground app/PID, ConsoleID, model, actual and reported (spoofable) firmware, confirm button, language, battery, ux0 free space, Wi-Fi/BT/airplane mode/mic, MAC, IMEI applicability, overlay, Settings-style info, and enabled plugins grouped by tai section. Check each field's `error_code` and nulls. Having no foreground app is normal at LiveArea.
 - **system reboot**: cold reset, sent after the accepted reply. It may be refused while installs or content operations are running. Finish all transfers and readbacks first. A disconnect is expected; let `serve` reconnect, or run `session connect`, after boot. Pairing and the tai config are untouched.
 - **system capabilities**: native feature list. Use it to confirm the command path works and to check the installed build. A CLI command existing does not mean the firmware supports it.

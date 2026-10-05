@@ -7,6 +7,7 @@ import ftplib
 import io
 import ipaddress
 import os
+import shlex
 from pathlib import Path
 import subprocess
 import textwrap
@@ -89,14 +90,12 @@ def _exclude_private_directory(folder, is_directory=True):
         path.write_text(text.rstrip('\n') + '\n' + pattern + '\n')
 
 
-def save_setup(folder, host, name, active_config):
+def save_setup(folder, host, name):
     import pair_vita
     folder = folder.expanduser().resolve()
     if folder.exists() and not folder.is_dir():
         raise ClientError('Configuration directory is not a directory.')
     folder.parent.mkdir(parents=True, exist_ok=True)
-    active_config.parent.mkdir(parents=True, exist_ok=True)
-    _exclude_private_directory(active_config, is_directory=False)
     _exclude_private_directory(folder)
     folder.mkdir(mode=0o700, exist_ok=True)
     previous_base = pair_vita.BASE
@@ -109,8 +108,6 @@ def save_setup(folder, host, name, active_config):
     config = folder / 'config.json'
     durable_json(config, {'device_dir': '.', 'vita_ip': host, 'agent_name': name,
                           'screen_off_when_done': True})
-    if config.resolve() != active_config.resolve():
-        durable_json(active_config, {'config_file': str(config)})
     return config
 
 
@@ -193,18 +190,18 @@ class Terminal:
                 selected = (selected+1) % len(options)
 
 
-def run(active_config):
+def run():
     if not os.isatty(0) or not os.isatty(1):
         raise ClientError('bootstrap is for humans and requires an interactive terminal.')
     def wizard(screen):
         ui = Terminal(screen)
-        default = Path.cwd() / 'agent' / 'vita-agent-use'
+        default = Path(os.environ['VITA_AGENT_CONFIG_DIR']).expanduser() if os.environ.get('VITA_AGENT_CONFIG_DIR') else Path.cwd() / 'agent' / 'vita-agent-use'
         def check_folder(value):
             if not value.strip():
                 raise ClientError('Enter a configuration directory.')
         folder = Path(ui.ask('Configuration directory', [
             'Choose where to save config.json and the private PC identity.',
-            'The default is a folder beneath the current working directory.',
+            'Default: the selected environment directory, or a folder beneath the current directory.',
             'Ctrl+U clears the field. Existing PC identities are retained.'], str(default), check_folder)).expanduser().resolve()
         def check_ip(value):
             ipaddress.IPv4Address(value)
@@ -241,15 +238,18 @@ def run(active_config):
         if name == 'Custom':
             name = ui.ask('Custom agent name', ['Enter the agent name.'], validate=validate_agent_name)
         ui.choose('Save configuration', ['Directory: ' + str(folder), 'Vita: ' + host, 'Agent: ' + name,
-                  'This creates or retains the PC identity and selects this config automatically.',
+                  'This creates or retains the PC identity in this directory.',
                   'An existing config.json in this directory will be updated.'], ['Save'])
-        config = save_setup(folder, host, name, active_config)
+        config = save_setup(folder, host, name)
         ui.choose('Setup complete', ['Saved: ' + str(config), 'The PC identity is ready. No Vita files were changed.',
-                  'Agents use this config automatically, without config arguments.',
+                  'Set this in your shell or agent launch environment:',
+                  'export VITA_AGENT_CONFIG_DIR=' + shlex.quote(str(folder)),
                   'First connection: python3 client/vita_agent.py session pair (tap OK on the Vita).',
                   'Then start the PC event server: python3 client/vita_agent.py serve'], ['Finish'])
         return config
     try:
-        return curses.wrapper(wizard)
+        config = curses.wrapper(wizard)
+        print('export VITA_AGENT_CONFIG_DIR=' + shlex.quote(str(config.parent)))
+        return config
     except curses.error as exc:
         raise ClientError("Could not initialize or draw the terminal UI: " + str(exc)) from exc

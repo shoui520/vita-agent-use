@@ -23,7 +23,7 @@ Large negative numbers are Sony codes, not these. Keep both the signed decimal a
 
 | Symptom | Action |
 |---|---|
-| Missing config, or wrong Vita or name | Check the working directory, `--config`, the pointer target and file permissions. Global flags go before the command. Never copy the client once per Vita. |
+| Missing config, or wrong Vita or name | Check `VITA_AGENT_CONFIG_DIR`, its `config.json`, and file permissions. It must be an absolute directory containing the intended config and `pc/`. Export it in the agent/server process environment. Old pointer files are unsupported; select the directory containing the actual config. Never copy the client once per Vita. |
 | Private JSON rejected | It must be a regular, user-owned file (`chmod 600`); check its shape, size and duplicate keys. Never loosen the checks. |
 | `bootstrap` fails for the agent | It needs a human at a terminal. |
 | Server socket missing | Start `serve` with the same state directory. |
@@ -67,7 +67,7 @@ Large negative numbers are Sony codes, not these. Keep both the signed decimal a
 The plugin stores one trusted PC certificate in `ur0:data/vita-agent-use/peer.der`. Different agent names can share that identity. A fresh identity can replace it using the normal pairing command and physical approval; no file copying or VitaShell trust reset is needed.
 
 1. Finish/cancel active runs, wait for any coredump to finalize, and stop the current PC server. Reconcile uncertain effects before replacement. Stopping `serve` does not necessarily end the Vita-side session. If pairing is refused and diagnostics reports `commands listening`, reboot the Vita with the old server stopped before attempting the new pairing. While the command session remains active, the pairing port is closed.
-2. Run `./vita-agent --config <your-config.json> session pair` from the new configuration. It creates the PC identity if needed.
+2. Set `VITA_AGENT_CONFIG_DIR` to the absolute directory containing the new configuration, then run `./vita-agent session pair`. It creates the PC identity if needed.
 3. Check the fingerprint and tap OK on the Vita. For a different saved peer, the dialog explicitly says this replaces the previously paired computer. Cancel or timeout keeps the old peer.
 4. Start `serve` using the same config. Its `device_dir` is ordinary private PC storage; no particular directory name or pre-existing test files are required.
 

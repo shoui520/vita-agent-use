@@ -31,22 +31,25 @@ Skills for external tools: [vita-gpuprof](docs/vita-gpuprof/SKILL.md) (GPU profi
 ## Invocation and config
 
 ```sh
-./vita-agent [--config FILE] <command> ...
+export VITA_AGENT_CONFIG_DIR="/absolute/path/chosen-in-bootstrap"
+./vita-agent <command> ...
 # Equivalent direct invocation:
-python3 /path/to/vita-agent-use/client/vita_agent.py [--config FILE] <command> ...
+python3 /path/to/vita-agent-use/client/vita_agent.py <command> ...
 ```
 
 The launcher requires Python 3 on PATH, forwards every argument and exit code, and preserves the caller's working directory. It can also be invoked by its absolute path from another project directory.
 
-- Without `--config`, the client loads `config.json` from the **current directory**, not from beside the script. Global options (`--config`, `--device-dir`, `--credentials`, `--state`, `--macro-store`) go **before** the command and override config paths. Examples assume the repo is the working directory.
-- The config keys are `device_dir` (holds `pc/credentials.json`, `pc/state.json`, certificates and private runtime storage), `vita_ip`, `agent_name` (1–128 UTF-8 bytes; a display label, not an ACL identity), `screen_off_when_done` (default `true`), `macro_store` (default `pc/macros/`), and `credentials`/`state` as explicit alternatives to `device_dir`. Unknown keys are rejected.
-- Paths inside a config are relative to the config file, and `~` expands. CLI file arguments are relative to the directory the CLI is run from. A one-level pointer file `{"config_file":"./private-vita/config.json"}` is accepted; it must contain only that key, and its target must be a real config, not another pointer. Bootstrap writes a pointer. A missing `--config` file is an error; a missing default config can be bypassed with explicit path flags.
-- Configs that share a `device_dir` share the PC identity, state, server and ACL subject. Use separate directories and servers for different Vitas, and separate config files for different names; there is no profile flag. A running server keeps the name and IP it started with.
+- `VITA_AGENT_CONFIG_DIR` is required for normal commands. Set it to the absolute directory chosen in `bootstrap`, containing `config.json` and `pc/`. The client always reads `$VITA_AGENT_CONFIG_DIR/config.json`, regardless of its working directory. There is no config-path CLI flag, working-directory fallback or pointer-file support. Help, bootstrap and diagnostics with an explicit `--host` work without the variable.
+- Bootstrap prints `export VITA_AGENT_CONFIG_DIR=...` after setup. Export it in the shell or configure it in the agent's launch environment; a subprocess cannot change its parent shell. To persist it, add that export to your shell startup file or agent launcher. Existing bootstrap directories can be selected directly without regenerating their identity.
+- The config keys are `device_dir` (bootstrap writes `"."`, placing the identity, credentials, state and server under this directory's `pc/`), `vita_ip`, `agent_name` (1–128 UTF-8 bytes; a display label, not an ACL identity), `screen_off_when_done` (default `true`), `macro_store` (default `pc/macros/`), and `credentials`/`state` as advanced explicit paths inside the config. Unknown keys are rejected. The CLI has no `--device-dir`, `--credentials` or `--state` overrides.
+- Paths inside a config are relative to that config file, and `~` expands. CLI file arguments are relative to the directory the CLI is run from. `--macro-store` may override macro storage and goes before the command.
+- For multiple Vitas, bootstrap each into its own directory and give each agent process its corresponding `VITA_AGENT_CONFIG_DIR`. Processes sharing a directory share the PC identity, state, server and ACL subject. Changing the directory does not transfer pairing. A running server keeps the name and IP it started with.
+
 - Private JSON must be a regular, user-owned file with no group/world permissions (hand-written ones usually need `chmod 600`) and at most about 512 KiB. Never expose tokens, keys, fingerprints, console IDs or real network details in public files.
 
 ## Setup and the server
 
-- `bootstrap` is a **human-only** curses TUI (minimum 50×18). It asks for a config directory (default `agent/vita-agent-use/`), IP and name. It reads `ur0:tai/config.txt` over VitaShell FTP on port 1337. VitaCompanion blocks setup; BGFTP, catlog, kvdb, psp2shell_ and vdbtcp produce warnings; NoLockScreen is recommended. It never writes to the Vita.
+- `bootstrap` is a **human-only** curses TUI (minimum 50×18). It asks for a config directory (default `agent/vita-agent-use/`), IP and name. It reads `ur0:tai/config.txt` over VitaShell FTP on port 1337. VitaCompanion blocks setup; BGFTP, catlog, kvdb, psp2shell_ and vdbtcp produce warnings; NoLockScreen is recommended. It never writes to the Vita. It saves config and PC identity together and prints the environment export; it does not write a pointer file.
 - The Vita creates its own identity in `ur0:data/vita-agent-use/` on first boot. Deleting that directory resets peer trust and ACLs; it is not routine troubleshooting.
 - The Vita trusts **one PC certificate at a time**. Different agent names/configs can share that identity; a fresh PC identity can replace the saved peer through `session pair` and physical OK. Reuse the original private PC identity with `session connect`, or follow the peer-replacement procedure in [recovery.md](docs/agent-reference/recovery.md#replacing-the-trusted-pc). There is no multi-peer or agent unpair command. Replacement preserves the Vita identity; ACLs remain scoped to the approving PC identity.
 - First connection: `session pair`, where the human taps OK and the Vita certificate pin is saved, then `serve`. Later, `session connect` gets a fresh temporary token from the saved pairing. Pairing survives reboots; tokens last at most one hour, with a 30-minute idle limit. Ports: 8847 pairing/session, 8848 commands, 8846/UDP diagnostics. They need not all be open at once.
