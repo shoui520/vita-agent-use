@@ -103,6 +103,15 @@ static int visit(void *context, const char *path)
 	return VAU_OK;
 }
 
+/*
+ * Every filesystem mutation runs through here, in this order:
+ *
+ *   1. validate the request shape and normalize its path(s)
+ *   2. policy for the path (and for a rename's destination)
+ *   3. journal lookup: a known (subject, id) answers from the record, never reruns
+ *   4. preflight policy over every descendant, before anything is touched
+ *   5. durable INTENT record, then apply(), then COMPLETE record
+ */
 int vau_write_execute(const struct vau_file_policy *policy, const struct vau_write_adapter *a,
                       const struct vau_write_request *request, struct vau_write_record *out)
 {

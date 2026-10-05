@@ -16,6 +16,20 @@ extern void vauPafFree(void *);
 #define VAU_IO_ENOENT ((int)0x80010002u)
 #define VAU_IO_EEXIST ((int)0x80010011u)
 
+/*
+ * Resumable, verified uploads. Bytes are staged privately and only reach the
+ * destination in vau_upload_commit():
+ *
+ *   begin   journal PREPARE for (subject, id) and create the stage file
+ *           <mount>:data/vita-agent-use/transactions/<subject>_<id>.part,
+ *           or report how many bytes an earlier attempt already staged
+ *   chunk   write at an offset; bytes that were already staged must match
+ *   verify  check the full size and SHA-256 against the request
+ *   commit  rename into place under journal control (upload_commit.c)
+ *
+ * The stage sits on the destination's own mount, so commit can be a rename.
+ */
+
 static int hex(const char *p, unsigned n)
 {
 	for (unsigned i = 0; i < n; ++i)
@@ -433,6 +447,8 @@ int vau_upload_chunk(struct vau_upload_context *c, const struct vau_write_reques
 		return position < 0 ? (int)position : VAU_DEVICE_ERROR;
 	}
 
+	/* A retried chunk may overlap what is already staged. Those bytes must match
+	 * exactly: retries stay harmless, and a different payload is STALE. */
 	uint64_t old     = before.bytes - offset;
 	uint32_t overlap = old < bytes ? (uint32_t)old : bytes, at = 0;
 	unsigned scratch      = overlap < VAU_FILE_READ_BYTES ? overlap : VAU_FILE_READ_BYTES;

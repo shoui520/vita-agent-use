@@ -21,6 +21,7 @@ int vau_stop_observe(struct vau_stop_monitor *m, int result, uint32_t mask, uint
 	m->buttons        = buttons;
 	m->reason         = 0;
 
+	/* reason codes are public diagnostics: see VauInputObservation in vita_agent.h. */
 	int error = 0;
 
 	if (result < 0) {
@@ -30,6 +31,7 @@ int vau_stop_observe(struct vau_stop_monitor *m, int result, uint32_t mask, uint
 		error     = VAU_DEVICE_ERROR;
 		m->reason = 2;
 	} else if ((mask & VAU_STOP_CHORD) != VAU_STOP_CHORD) {
+		/* Something masked PS or SELECT, so the emergency stop could go unseen. */
 		error     = VAU_DENIED;
 		m->reason = 3;
 	}

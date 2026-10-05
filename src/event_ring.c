@@ -6,6 +6,11 @@
 #include "event_ring.h"
 #include <string.h>
 
+/*
+ * The hooks see every file SceCoredump opens or renames. Only the dump file
+ * itself (directly in ux0:data/, exact suffix, no separators) becomes an
+ * event, which also makes its path safe to forward to clients unchanged.
+ */
 int vau_dump_path(const char *path, unsigned kind)
 {
 	if (!path || (kind != VAU_DUMP_SAVING && kind != VAU_DUMP_COMPLETE))

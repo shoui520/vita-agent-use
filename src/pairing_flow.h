@@ -9,6 +9,19 @@
 #include "pairing_tls.h"
 #include "pairing_worker.h"
 
+/*
+ * First pairing, end to end:
+ *
+ *   pairing_tls         handshake; proves the PC holds its key (not approval)
+ *   pairing_request     reads and validates the display name it sends
+ *   pairing_worker      posts the dialog to the Shell UI thread and waits
+ *   pairing_ui          the native OK/Cancel prompt itself
+ *   pairing_activation  on OK: issues the grant and its token
+ *
+ * This flow sequences those steps; shell_runtime then stores the peer
+ * certificate (store_peer) and delivers the token.
+ */
+
 /* Borrowed resident objects, owned by one serialized Shell worker. Native UI
  * modules must be ready and the owner must check dialog coexistence before
  * allowing this attempt, as required by pairing_worker_begin. This coordinator

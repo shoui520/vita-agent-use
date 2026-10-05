@@ -8,6 +8,7 @@
 #include <string.h>
 #include <stdio.h>
 
+/* Volatile stores, so clearing secrets cannot be optimized away as dead writes. */
 static void wipe(void *data, size_t size)
 {
 	volatile unsigned char *p = data;
@@ -73,6 +74,10 @@ int vau_auth_grant(struct vau_auth *a, unsigned rights, uint64_t now, uint64_t l
 		return rc < 0 ? rc : VAU_DEVICE_ERROR;
 	}
 
+	/*
+	 * Treat an all-zero token as an entropy failure: it is what a broken source
+	 * tends to return, and it equals the wiped token held by every free slot.
+	 */
 	unsigned nonzero = 0;
 
 	for (unsigned i = 0; i < sizeof(random); ++i)
@@ -156,6 +161,7 @@ struct vau_session *vau_auth_lookup(struct vau_auth *a, const char *token, size_
 
 	reap(a, now);
 
+	/* Visit every slot, so timing does not reveal whether or where a token matched. */
 	struct vau_session *found = NULL;
 
 	for (unsigned i = 0; i < VAU_AUTH_SLOTS; ++i) {
@@ -183,6 +189,8 @@ int vau_auth_rearm(struct vau_auth *a, uint64_t generation)
 		return VAU_INVALID;
 	if (!a->stopped || !generation || generation != a->stop_generation)
 		return VAU_STALE;
+
+	/* A saturated generation no longer changes per stop, so an old approval could match. */
 	if (generation == UINT64_MAX)
 		return VAU_DENIED;
 

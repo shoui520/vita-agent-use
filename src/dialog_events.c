@@ -27,6 +27,7 @@ static int hook_id = -1;
 static int error_string(char *out, int code)
 {
 	int rc = TAI_CONTINUE(int, error_ref, out, code);
+
 	if (rc < 0 || !atomic_load_explicit(&enabled, memory_order_relaxed))
 		return rc;
 	if (atomic_flag_test_and_set_explicit(&busy, memory_order_acquire)) {
@@ -114,6 +115,7 @@ int vau_vita_dialog_events(void *ctx, uint32_t operation, uint32_t after, char *
                 "%s{\"sequence\":%u,\"type\":\"dialog.error\",\"observed_us\":\"%llu\",\"code\":%d,\"raw_hex\":\"0x%08x\",\"display_confirmed\":false}",
                 i ? "," : "", e->sequence, (unsigned long long)e->observed_us, (int32_t)e->code,
                 e->code);
+
 		if (add < 0 || (size_t)add >= cap - (size_t)n) {
 			rc = VAU_DEVICE_ERROR;
 			goto done;

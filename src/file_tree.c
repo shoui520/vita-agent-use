@@ -38,6 +38,8 @@ int vau_native_tree_walk(const char *root, int post, vau_tree_visit visit, void 
 			return rc;
 	}
 
+	/* Depth-first with an explicit stack, not recursion (Shell threads have small
+	 * stacks). Each level adds at least "/x", so PATH_MAX / 2 frames always suffice. */
 	struct frame frames[VAU_PATH_MAX / 2];
 	unsigned depth = 0;
 	int fd         = sceIoDopen(path);
@@ -100,6 +102,8 @@ int vau_native_tree_walk(const char *root, int post, vau_tree_visit visit, void 
 			path[base++] = '/';
 		memcpy(path + base, entry.d_name, bytes + 1);
 
+		/* A name that does not survive normalization unchanged (short-name alias,
+		 * trailing dot, ...) cannot be policy-checked reliably: refuse the walk. */
 		char normalized[VAU_PATH_MAX];
 
 		if (vau_path_normalize(path, normalized, sizeof(normalized)) || strcmp(path, normalized)) {

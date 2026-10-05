@@ -47,6 +47,7 @@ int vau_vita_confirmation_button(uint32_t *mask)
 	if (value != 0 && value != 1)
 		return VAU_DEVICE_ERROR;
 
+	/* 1 = Cross confirms (most regions), 0 = Circle (Japan): SCE_CTRL_CROSS / SCE_CTRL_CIRCLE. */
 	*mask = value ? 0x4000u : 0x2000u;
 	return VAU_OK;
 }

@@ -38,6 +38,11 @@ static int media_sdk_bind(struct vau_media_sdk *s)
 	if (rc)
 		return rc;
 
+	/*
+	 * Private firmware functions, resolved by NID. Each nids[] table in this
+	 * file lists them in the order of the function pointers bound from it, and
+	 * has only been verified against firmware 3.65.
+	 */
 	const uint32_t nids[]  = { 0x668cb1e5, 0xaf89df37, 0x1a67467d, 0x70b406bd };
 	uintptr_t addresses[4] = { 0 };
 

@@ -12,6 +12,8 @@
 #ifdef VAU_NATIVE_FORMAT
 #include "sqlite_memory.h"
 #include "sqlite_vfs.h"
+
+/* Raw SQLite result codes and the -65536 error encoding: see sqlite_api.h. */
 #endif
 static const char fields[] =
         "sequence,subject,operation_id,title,yes,state,before_registry,before_application,after_known,after_"
@@ -311,6 +313,8 @@ int vau_content_journal_open(struct vau_content_journal *j, const char *path, in
 		                        NULL));
 	}
 
+	/* Same durability rule as the write journal; migrations below follow the same
+	 * user_version scheme: never edit a shipped step, add a new one. */
 	if (!rc && !readonly) {
 		rc = error(sqlite3_exec(db,
 		                        "PRAGMA journal_mode=DELETE;PRAGMA synchronous=FULL;PRAGMA "

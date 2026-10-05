@@ -11,6 +11,8 @@
 
 #ifdef VAU_NATIVE_FORMAT
 #include "sqlite_memory.h"
+
+/* Raw SQLite result codes and the -65536 error encoding: see sqlite_api.h. */
 #endif
 
 static int media_links_number(sqlite3_stmt *s, int column, uint64_t *out)

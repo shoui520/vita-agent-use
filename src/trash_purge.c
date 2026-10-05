@@ -18,6 +18,11 @@ struct purge_context {
 	unsigned *started;
 };
 
+/*
+ * Purge may only remove what a completed, successful trash operation by the
+ * same peer moved, for the same original path. The physical trash location is
+ * derived from that journal record, never from the request.
+ */
 static int provenance(struct purge_context *p, const struct vau_write_request *r)
 {
 	struct vau_write_record trash;
@@ -41,6 +46,8 @@ static int provenance(struct purge_context *p, const struct vau_write_request *r
 	return vau_mutation_trash_path(&trash.request, p->physical);
 }
 
+/* Maps a path inside the trash entry back to its original location, so policy
+ * and audit always reason about logical paths, not trash internals. */
 static int logical(struct purge_context *p, const char *physical, char path[VAU_PATH_MAX])
 {
 	size_t base = strlen(p->physical), root = strlen(p->request->path), length = strlen(physical);

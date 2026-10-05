@@ -16,6 +16,12 @@ static int (*buffer_sizes)(const uint32_t *, uint32_t *);
 static int (*encode_image)(const uintptr_t *, const uintptr_t *);
 static void *(*capture_context)(void);
 
+/*
+ * Private routines behind SceShell's own PS+START screenshot, at fixed offsets
+ * in its code segment for firmware 3.65 (+1: Thumb). Only the module NID and
+ * segment size are checked here, not the instruction bytes (compare
+ * touch_kernel.c), so any new firmware target must re-verify these offsets.
+ */
 static int bind_shell(void)
 {
 	if (buffer_sizes && encode_image && capture_context)
@@ -66,6 +72,7 @@ int vau_shell_capture_buffer(void **pixels, size_t *capacity)
 
 	/* Borrow the buffer Shell allocates through its graphics allocator for
 	 * PS+START. Never free it, or reuse it during an active native screenshot. */
+	/* Capture context: +0xe70 buffer, +0xe74 its size, +0xe7c nonzero while busy. */
 	if (*(uint32_t *)(context + 0xe7c))
 		return VAU_BUSY;
 

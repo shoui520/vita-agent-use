@@ -11,6 +11,8 @@
 #ifdef VAU_NATIVE_FORMAT
 #include "sqlite_memory.h"
 #include "sqlite_vfs.h"
+
+/* Raw SQLite result codes and the -65536 error encoding: see sqlite_api.h. */
 #endif
 static int error(int rc)
 {
@@ -220,6 +222,8 @@ int vau_journal_open(struct vau_write_journal *j, const char *path)
 		return rc;
 	}
 
+	/* FULL sync: a record must be on disk before the action it describes starts,
+	 * because crash recovery trusts it. The small cache keeps Shell's heap free. */
 	rc = exec(
 	        db,
 	        "PRAGMA journal_mode=DELETE;PRAGMA synchronous=FULL;PRAGMA cache_size=32;PRAGMA temp_store=MEMORY");
@@ -283,6 +287,11 @@ int vau_journal_open(struct vau_write_journal *j, const char *path)
 		}
 	}
 
+	/*
+	 * Migrations, keyed on user_version. A new database is created at the
+	 * latest schema above; older ones step forward one transaction at a time.
+	 * Journals on consoles outlive builds: never edit a shipped step, add one.
+	 */
 	if (!rc && version == 1) {
 		rc = exec(
 		        db,

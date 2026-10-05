@@ -8,6 +8,8 @@
 #include "json.h"
 #include <string.h>
 
+/* Raw SQLite result codes and the -65536 error encoding: see sqlite_api.h. */
+
 static int same(const struct vau_content_delete_request *a,
                 const struct vau_content_delete_request *b)
 {

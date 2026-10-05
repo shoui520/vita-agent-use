@@ -36,6 +36,14 @@ static int integer(const char *json, const struct vau_json_token *token, uint64_
 	return vau_json_u64(s, &number, out) || *out > INT64_MAX ? VAU_INVALID : VAU_OK;
 }
 
+/*
+ * POST /v1/file/upload body:
+ *
+ *   [u32 big-endian n][n bytes of JSON metadata][chunk bytes, the rest]
+ *
+ * The JSON names the action (begin, chunk, verify, commit, recover) and the
+ * request; subject is the authenticated peer's identity, never read from the body.
+ */
 int vau_upload_wire_parse(const void *body, size_t bytes, const char *subject,
                           struct vau_upload_message *out)
 {

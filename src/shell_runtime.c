@@ -194,6 +194,20 @@ static int identity_io(int fd, void *data, size_t size, int writing)
 	return 0;
 }
 
+/*
+ * The device TLS identity, in order of preference:
+ *
+ *   1. identity.bin: [u32 cert size][u32 key size][cert DER][key DER], with the
+ *      file size checked against both lengths before anything is read.
+ *   2. Legacy device.der + device-key.der from older builds.
+ *   3. A freshly generated identity, written to identity.bin.tmp and renamed
+ *      into place so a crash never leaves a half-written identity behind.
+ *
+ * Generation only happens when nothing exists. A lone device-key.der, or a
+ * retained peer.der, means trust state survives without its certificate, and
+ * replacing it would silently break pairing, so that is reported instead.
+ * 0x80010002 (SCE_ERROR_ERRNO_ENOENT) is the "absent" answer throughout.
+ */
 static int load_identity(void)
 {
 	int fd = sceIoOpen(ROOT "identity.bin", SCE_O_RDONLY, 0);
@@ -283,6 +297,11 @@ static int load_identity(void)
 	return rc;
 }
 
+/*
+ * Replaces the trusted peer certificate: write peer.der.tmp, move peer.der
+ * aside to peer.previous.der, then rename the new file into place. A failure
+ * restores the previous file; a crash between the renames is repaired at boot.
+ */
 static int store_peer(void)
 {
 	int fd = sceIoOpen(ROOT "peer.der.tmp", SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0666);
@@ -625,6 +644,7 @@ static int runtime_thread(SceSize args, void *argp)
 		return 0;
 	}
 
+	/* Only peer.previous.der left means store_peer() was interrupted between renames. */
 	rc = read_der(ROOT "peer.der", peer, &peer_size);
 	if ((uint32_t)rc == UINT32_C(0x80010002)) {
 		int previous = read_der(ROOT "peer.previous.der", peer, &peer_size);

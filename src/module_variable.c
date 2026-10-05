@@ -16,6 +16,17 @@ static uint32_t u32(const unsigned char *p)
 	return p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
+/*
+ * Finds an exported variable by NID by walking a module's export table
+ * [start, end). Each entry begins with a 32-byte header:
+ *
+ *   +0   u16 entry size        +16  u32 library NID
+ *   +6   u16 function count    +24  u32 address of the NID table
+ *   +8   u16 variable count    +28  u32 address of the entry table
+ *
+ * Both tables list functions first, then variables. A NID found twice is
+ * treated as corruption rather than guessing which one is meant.
+ */
 int vau_module_variable(void *context, vau_memory_read read, uintptr_t start, uintptr_t end,
                         uint32_t library, uint32_t nid, uintptr_t *out)
 {

@@ -13,6 +13,12 @@
 #include <stdio.h>
 #include <string.h>
 
+/*
+ * Adding an operation takes three edits that nothing checks at compile time:
+ * this enum, operations[] below (same index), and the "operations" list in the
+ * capabilities reply. Range checks such as OP_RUN_BEGIN..OP_RUN_STATUS also
+ * depend on the order here.
+ */
 enum {
 	OP_CAPABILITIES,
 	OP_SNAPSHOT,
@@ -1290,6 +1296,8 @@ static int touch_panels_reply(const struct vau_native_api *api, char *out, size_
 	        panels[1]);
 }
 
+/* One shared parse workspace: too large for the calling thread's stack. The
+ * flag turns accidental unserialized re-entry into VAU_BUSY, not corruption. */
 static struct {
 	struct vau_command command;
 	struct vau_json_token tokens[VAU_COMMAND_TOKENS];
@@ -1300,6 +1308,7 @@ static atomic_flag workspace_busy = ATOMIC_FLAG_INIT;
 static void command_digest(const struct vau_command *command, unsigned char digest[32])
 {
 	struct vau_sha256 hash;
+
 	vau_sha256_init(&hash);
 
 	/* The header is zero-initialized on every parse, including padding. Hash
@@ -1331,6 +1340,12 @@ static int request_locked(struct vau_session *s, const struct vau_native_api *ap
 
 	vau_snprintf(id, sizeof(id), "\"%llu\"", (unsigned long long)command->id);
 
+	/*
+	 * Read-only operations need OBSERVE, everything else CONTROL. Note that
+	 * every operation from OP_EVENTS_START on defaults to OBSERVE, so a new
+	 * effectful operation appended to the enum must also join the CONTROL
+	 * list just below.
+	 */
 	unsigned right = command->operation <= OP_SNAPSHOT || (command->operation == OP_FILE_STAT ||
 	                                                       command->operation == OP_FILE_LIST ||
 	                                                       command->operation == OP_TOUCH_PANELS ||
@@ -1371,6 +1386,8 @@ static int request_locked(struct vau_session *s, const struct vau_native_api *ap
 
 	unsigned char digest[32];
 
+	/* Exactly once per session: the same id with the same command replays the
+	 * stored reply without executing again; anything else under it is STALE. */
 	command_digest(command, digest);
 	if (command->id == s->last_id) {
 		if (memcmp(digest, s->last_digest, sizeof(digest)))

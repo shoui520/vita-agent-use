@@ -10,6 +10,8 @@
 
 #ifdef VAU_NATIVE_FORMAT
 #include "sqlite_memory.h"
+
+/* Raw SQLite result codes and the -65536 error encoding: see sqlite_api.h. */
 #endif
 int vau_livearea_layout(const char *path, const char *section, uint32_t offset, char *out,
                         size_t cap)

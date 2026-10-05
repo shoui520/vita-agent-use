@@ -16,8 +16,11 @@
 struct vau_content_sdk_loader {
 	void *context;
 
+	/* 0 = already loaded, 1 = must call load() first, < 0 = error. */
 	int (*loaded)(void *);
 	int (*load)(void *);
+
+	/* Resolves an export NID inside the loaded module; 0 with *out == 0 is a miss. */
 	int (*resolve)(void *, uint32_t, uintptr_t *);
 };
 

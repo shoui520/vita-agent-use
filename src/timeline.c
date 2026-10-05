@@ -8,6 +8,7 @@
 #include <limits.h>
 #include <stddef.h>
 
+/* These structures cross the user/kernel syscall boundary; their layout is ABI. */
 _Static_assert(sizeof(VauPad) == 8, "pad ABI");
 _Static_assert(sizeof(VauEvent) == 12, "event ABI");
 _Static_assert(sizeof(VauSequence) == 40, "sequence ABI");
@@ -166,6 +167,13 @@ static int submit(struct vau_timeline *t, const VauSequence *s, const VauEvent *
 	return VAU_OK;
 }
 
+/*
+ * Macro streaming. The running segment plays from event_banks[bank] while at
+ * most one continuation waits in the other bank. Callers send start_us = 0:
+ * the continuation starts exactly where the running segment ends, so segments
+ * join on the Vita clock however late the network delivered them. Re-sending
+ * the running or queued request ID is an idempotent acknowledgement.
+ */
 int vau_timeline_enqueue(struct vau_timeline *t, const VauSequence *s, const VauEvent *events,
                          const VauTouchState *touch, const struct vau_touch_panel panels[2],
                          uint64_t now, int validate_only)
@@ -339,6 +347,11 @@ int vau_timeline_check_process(struct vau_timeline *t, int observed, int observa
 	              context);
 }
 
+/*
+ * Driven by the kernel input worker. Applies at most one event per call, and
+ * every terminal path goes through finish(), which returns emulated input to
+ * neutral before the state is reported.
+ */
 int vau_timeline_tick(struct vau_timeline *t, uint64_t now, vau_apply_pad apply, void *context)
 {
 	t->status.now_us = now;

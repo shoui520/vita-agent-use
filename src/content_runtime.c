@@ -7,6 +7,8 @@
 #include "format.h"
 #include <string.h>
 
+/* Raw SQLite result codes and the -65536 error encoding: see sqlite_api.h. */
+
 static uint64_t clock_now(void *ctx)
 {
 	struct vau_content_runtime *r = ctx;

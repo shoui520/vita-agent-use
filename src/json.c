@@ -80,6 +80,8 @@ static int string(struct parser *p)
 				return -1;
 			}
 		} else if (c >= 128) {
+			/* Strict UTF-8: no overlong forms (they can smuggle '/' or '.' past
+			 * path checks), no surrogates, nothing above U+10FFFF. */
 			unsigned n, value, minimum;
 
 			if (c >= 0xc2 && c <= 0xdf) {

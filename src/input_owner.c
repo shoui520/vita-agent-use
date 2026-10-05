@@ -36,6 +36,10 @@ int vau_input_owner_init(struct vau_input_owner *in, const struct vau_input_brid
 	return VAU_OK;
 }
 
+/*
+ * The cleanup flag stays set until the kernel confirms the release, so every
+ * later poll retries it, and the stale handle keeps new owners out meanwhile.
+ */
 static int cleanup(struct vau_input_owner *in)
 {
 	in->cleanup = 1;
@@ -57,6 +61,7 @@ int vau_input_owner_poll(struct vau_input_owner *in, const struct vau_auth *auth
 	if (!in || !in->initialized || !auth)
 		return VAU_INVALID;
 
+	/* A clock that ran backwards makes every lease deadline meaningless. */
 	uint64_t now  = in->bridge.clock(in->bridge.context);
 	int backwards = now < in->last_us;
 
@@ -103,6 +108,7 @@ int vau_input_owner_acquire_process(struct vau_input_owner *in, const struct vau
 	if (process && !in->bridge.acquire_process)
 		return VAU_UNSUPPORTED;
 
+	/* The kernel keeps its own lease of the same length; either expiring ends ownership. */
 	rc = process ? in->bridge.acquire_process(in->bridge.context, process)
 	             : in->bridge.acquire(in->bridge.context);
 	if (rc >= 0) {

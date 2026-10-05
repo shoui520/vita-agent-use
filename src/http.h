@@ -47,12 +47,13 @@ void vau_http_init_session(struct vau_http_request *request);
  * check the exact saved certificate before granting an automatic session. */
 void vau_http_init_admission(struct vau_http_request *request);
 
-/* One POST /v1/command, /v1/frame, /v1/file/read, /v1/file/upload or /v1/audit at a time. No
- * chunking or pipelining. After sending the complete response, the transport may reinitialize this
- * parser for the next request on the same authenticated connection. Honor close_connection and
- * close on framing errors. Authenticate EVERY request, including reused TLS.
- * Parsing does
- * NOT authenticate a bearer token. The transport must verify it against a
+/* One POST /v1/command, /v1/frame, /v1/file/read, /v1/file/upload or /v1/audit
+ * at a time. No chunking or pipelining. After sending the complete response,
+ * the transport may reinitialize this parser for the next request on the same
+ * authenticated connection. Honor close_connection and close on framing errors.
+ *
+ * Parsing does NOT authenticate the bearer token. Authenticate EVERY request,
+ * including those on reused TLS: the transport must verify the token against a
  * live on-device session over a protected channel before dispatching JSON. */
 enum vau_http_state vau_http_feed(struct vau_http_request *request, const void *data, size_t size);
 

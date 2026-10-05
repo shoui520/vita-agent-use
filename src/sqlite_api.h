@@ -6,6 +6,16 @@
 #ifndef VAU_SQLITE_API_H
 #define VAU_SQLITE_API_H
 
+/*
+ * The firmware's own SQLite (SceSqlite, imported through native365.yml), not a
+ * bundled copy. Only the entry points declared here are resolved, and sqlite3.h
+ * is never included, so callers use raw result codes:
+ *
+ *   0   SQLITE_OK      100 SQLITE_ROW      101 SQLITE_DONE
+ *
+ * Failures are surfaced as -65536 - code, which keeps them apart from both the
+ * small VAU_* codes and Sony's 0x8xxxxxxx errors in replies and audit records.
+ */
 typedef struct sqlite3 sqlite3;
 typedef struct sqlite3_stmt sqlite3_stmt;
 extern int sqlite3_open_v2(const char *, sqlite3 **, int, const char *);

@@ -6,6 +6,7 @@
 #include "vita_agent_policy.h"
 #include <string.h>
 
+/* Vita filesystems are case-insensitive, so every policy comparison is too. */
 static char lower(char c)
 {
 	return c >= 'A' && c <= 'Z' ? (char)(c + 'a' - 'A') : c;
@@ -98,6 +99,8 @@ int vau_path_normalize(const char *path, char *out, size_t capacity)
 			}
 		}
 
+		/* Trailing '.' or ' ' can alias the trimmed name on FAT-family drivers
+		 * (letting "tai." dodge the guard on "tai"); '.' and '..' are never needed. */
 		if (path[i - 1] == '.' || path[i - 1] == ' ' || (count == 1 && path[begin] == '.') ||
 		    (count == 2 && path[begin] == '.' && path[begin + 1] == '.')) {
 			return -1;

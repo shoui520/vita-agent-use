@@ -28,6 +28,7 @@ static _Atomic uint32_t enabled, head, frames[2];
 static int display_hook(int h, int plane, const SceDisplayFrameBuf *fb, int sync)
 {
 	int rc = TAI_CONTINUE(int, display_ref, h, plane, fb, sync);
+
 	if (rc >= 0 && atomic_load_explicit(&enabled, memory_order_relaxed) &&
 	    h == (int)atomic_load_explicit(&head, memory_order_relaxed) && (unsigned)plane < 2 && fb &&
 	    fb->base) {
@@ -45,6 +46,8 @@ static int read_native(uint32_t on, VauPerformanceRaw *out)
 	out->abi  = VAU_ABI;
 	if (on > 1)
 		return VAU_INVALID;
+
+	/* ksceDisplaySetFrameBufInternal: each framebuffer submission counts toward FPS. */
 	if (on && hook_id < 0) {
 		hook_id    = taiHookFunctionExportForKernel(0x10005, &display_ref, "SceDisplay", 0x9FED47AC,
 		                                            0x16466675, display_hook);

@@ -19,6 +19,8 @@ static int same_mount(const char *a, const char *b)
 	return x && y && x - a == y - b && !memcmp(a, b, (size_t)(x - a));
 }
 
+/* Trashing is a same-mount rename to <mount>:data/vita-agent-use/trash/<subject>_<id>;
+ * that operation id is what a later purge names as its trash id. */
 int vau_mutation_trash_path(const struct vau_write_request *r, char out[VAU_PATH_MAX])
 {
 	char stage[VAU_PATH_MAX];
@@ -251,6 +253,8 @@ struct recheck_context {
 	const struct vau_write_request *r;
 };
 
+/* Policy again for every descendant just before the rename, as preflight may be
+ * stale; for a move, each child is also checked at the path it will land on. */
 static int recheck(void *opaque, const char *path, const struct vau_file_info *info)
 {
 	(void)info;
@@ -280,6 +284,7 @@ static int recheck(void *opaque, const char *path, const struct vau_file_info *i
 	return VAU_OK;
 }
 
+/* Same journaled intent/done protocol as apply() in upload_commit.c. */
 static int apply(void *opaque, const struct vau_write_request *r, unsigned *started,
                  unsigned *readback)
 {

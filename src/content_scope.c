@@ -8,6 +8,8 @@
 #include <limits.h>
 #include <string.h>
 
+/* Raw SQLite result codes and the -65536 error encoding: see sqlite_api.h. */
+
 static int scope_error(int rc)
 {
 	return rc ? -65536 - rc : 0;

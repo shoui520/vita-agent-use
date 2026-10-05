@@ -10,6 +10,14 @@
 #include <psp2/io/stat.h>
 #include <stdio.h>
 
+/*
+ * The *main plugin listed in tai config.txt, kept tiny so that a broken runtime
+ * can never stop SceShell from booting: module_start only spawns a thread, which
+ * waits, loads the system modules the runtime imports from (NotificationUtil,
+ * SQLite), then starts ur0:tai/vita_agent_shell.suprx. Results go to
+ * loader.log. Updating the runtime is a file swap, never a config.txt edit.
+ */
+
 static void report(const char *stage, int result)
 {
 	char line[96];

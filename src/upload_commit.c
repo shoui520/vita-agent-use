@@ -202,6 +202,14 @@ static int config_check(void *context, const struct vau_write_request *r)
 	return rc ? rc : c->config_check(c, r, stage);
 }
 
+/*
+ * Every rename is bracketed by journal progress records ("*_intent" before,
+ * "*_done" after) and followed by a namespace sync. Once the first rename has
+ * happened (*started), any failure is VAU_RECOVERY_REQUIRED, never a plain
+ * error: the disk may be half-way and vau_upload_recover() must reconcile it
+ * from those records. An overwritten original is first moved beside the stage
+ * file, as transactions/<subject>_<id>.old, and verified there.
+ */
 static int apply(void *context, const struct vau_write_request *r, unsigned *started,
                  unsigned *readback)
 {

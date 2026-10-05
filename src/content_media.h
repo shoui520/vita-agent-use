@@ -69,6 +69,7 @@ union vau_media_db_storage {
 
 struct vau_media_db {
 	struct vau_content_sdk_loader loader;
+
 	void *(*construct)(void *);
 	void *(*destroy)(void *);
 	int (*open)(void *, const struct vau_media_sdk_string *, uint32_t);
@@ -100,6 +101,7 @@ void vau_vita_media_db_init(struct vau_media_db *);
  * cached exports from these modules must then be discarded before reuse. */
 struct vau_media_modules {
 	void *context;
+
 	int (*resolve)(void *, uint32_t, uintptr_t *);
 	int (*stopped)(void *);
 	void **(*acquire)(void **, const char *, unsigned, unsigned, void *);
@@ -128,6 +130,7 @@ void vau_vita_media_modules_init(struct vau_media_modules *, void *, int (*)(voi
  * copy them into the durable preview before accepting a destructive request. */
 struct vau_media_related {
 	void *context;
+
 	void (*release_path)(void *, void *);
 	int (*stopped)(void *);
 
@@ -172,6 +175,7 @@ int vau_media_profiler_walk(struct vau_media_profiler *, const char *, vau_media
  * are unmounted. Failed unmount retains ownership for explicit retry. */
 struct vau_media_music {
 	void *context;
+
 	int (*mount)(void *, int, char *);
 	int (*unmount)(void *, const char *);
 
@@ -187,10 +191,11 @@ void vau_vita_media_music_init(struct vau_media_music *);
 
 /* Internal worker-owned native video loopback (type600). Caller must hold the
  * native video dependencies during open/profiling; close uses resident AppMgr.
- * The resolved path is borrowed for the
- * lifetime of the mount; it is not a physical policy/audit path by itself. */
+ * The resolved path is borrowed for the lifetime of the mount; it is not a
+ * physical policy/audit path by itself. */
 struct vau_media_loopback {
 	void *context;
+
 	int (*drm_context)(void *, char *);
 	int (*mount)(void *, int, const char *, char *);
 	int (*unmount)(void *, const char *);

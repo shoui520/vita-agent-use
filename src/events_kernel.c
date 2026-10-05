@@ -61,7 +61,8 @@ int vau_dump_events_kernel(uint32_t operation, uint32_t after, VauDumpPage *out)
 
 	if (operation == 0) {
 		/* Only SceCoredump's verified 3.65 imports, not every system IO operation.
-		 * No hooks are installed during plugin start or normal boot. */
+		 * No hooks are installed during plugin start or normal boot.
+		 * SceIofilemgrForDriver (0x40FD29C7): ksceIoOpen 0x75192972, ksceIoRename 0xDC0C4997. */
 		if (open_id < 0) {
 			open_id = taiHookFunctionImportForKernel(0x10005, &open_ref, "SceCoredump", 0x40FD29C7,
 			                                         0x75192972, dump_open);

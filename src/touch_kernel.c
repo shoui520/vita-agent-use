@@ -11,6 +11,11 @@
 #include <psp2/touch.h>
 #include <string.h>
 
+/*
+ * SceTouch as shipped with firmware 3.65. vau_touch_kernel_enable() checks the
+ * module NID, the text size and the instruction bytes at both offsets before
+ * hooking, so any other build is refused (VAU_UNSUPPORTED) instead of patched.
+ */
 #define TOUCH_MODULE_NID UINT32_C(0xcac035de)
 #define TOUCH_TEXT_SIZE  UINT32_C(0x6b44)
 #define DECODE_OFFSET    UINT32_C(0x4510)
@@ -158,6 +163,7 @@ int vau_touch_kernel_enable(void)
 	for (unsigned i = 0; i < sizeof(owner_entry); i++)
 		if ((text[OWNER_OFFSET + i] & owner_mask[i]) != (owner_entry[i] & owner_mask[i]))
 			return VAU_UNSUPPORTED;
+	/* +1 selects Thumb mode for the call. */
 	coordinate_owner = (native_owner_fn)(uintptr_t)(text + OWNER_OFFSET + 1u);
 
 	/* The function pointer is ready before the installed hook can execute.

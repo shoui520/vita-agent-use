@@ -81,6 +81,7 @@ static uint64_t listing_clock;
 int vau_vita_file_list_reset(void)
 {
 	int fd = listing.fd;
+
 	if (fd < 0)
 		return VAU_OK;
 

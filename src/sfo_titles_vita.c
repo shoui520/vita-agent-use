@@ -18,6 +18,7 @@ struct source {
 static int exact(void *ctx, uint64_t offset, void *data, uint32_t count)
 {
 	struct source *s = ctx;
+
 	if (offset > s->bytes || count > s->bytes - offset || offset > INT64_MAX)
 		return VAU_INVALID;
 

@@ -57,8 +57,8 @@ struct vau_content_scope_page {
 };
 
 /* Zero-initialize the writer before first use. SQLite streams paths to disk
- * with fixed scratch memory. A scope
- * is visible only after its FULL-sync commit. Abort on any preflight error. */
+ * with fixed scratch memory. A scope is visible only after its FULL-sync
+ * commit. Abort on any preflight error. */
 int vau_content_scope_begin(struct vau_content_scope_writer *, struct vau_content_journal *,
                             const struct vau_content_delete_request *, enum vau_content_scope_phase,
                             uint64_t);

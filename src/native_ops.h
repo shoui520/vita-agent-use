@@ -106,6 +106,7 @@ int vau_firmware_valid(const struct vau_firmware *firmware);
 
 struct vau_native_api {
 	void *context;
+
 	uint64_t (*clock)(void *context);
 	int (*launch)(void *context, const char *uri);
 	int (*close)(void *context, const char *title);

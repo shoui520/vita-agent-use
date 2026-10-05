@@ -54,7 +54,7 @@ int vau_capture_kernel(void *pixels, uint32_t capacity, VauFrameInfo *info)
 	int index = 1;
 
 	rc = ksceDisplayGetProcFrameBufInternal(-1, head, index, &before);
-	if (rc == (int32_t)0x80029001u) {
+	if (rc == (int32_t)0x80029001u) { /* SCE_KERNEL_ERROR_INVALID_PID: no owner on index 1 */
 		index       = 0;
 		before.size = sizeof(before);
 		rc          = ksceDisplayGetProcFrameBufInternal(-1, head, index, &before);

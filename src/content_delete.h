@@ -30,6 +30,19 @@ struct vau_content_delete_request {
 	uint64_t media_id; /* Positive native MRID for media; zero for apps/savedata. */
 };
 
+/*
+ *   APPROVAL   durable record written; the native OK/Cancel prompt is showing
+ *   RUNNING    persisted before the native delete starts (effect_started)
+ *   COMPLETE   deleted, and confirmed by inspection afterwards
+ *   DENIED     Cancel, a policy recheck failed, or approval was interrupted
+ *   FAILED     refused before any effect (e.g. target changed since preview)
+ *   UNCERTAIN  the delete may have happened but cannot be confirmed; also any
+ *              RUNNING record found again after a reboot
+ *
+ * Path snapshots: PREVIEW is the plan the user reviews; BEFORE is taken after
+ * the physical OK and must cover exactly the reviewed paths; AFTER is taken
+ * once the native call finishes.
+ */
 enum vau_content_delete_state {
 	VAU_CONTENT_DELETE_IDLE,
 	VAU_CONTENT_DELETE_APPROVAL,

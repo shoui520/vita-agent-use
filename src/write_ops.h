@@ -23,6 +23,7 @@ struct vau_write_request {
 	                                         for tai config). */
 };
 
+/* Both enums are stored as integers in on-device write journals: never renumber. */
 enum vau_write_phase {
 	VAU_WRITE_INTENT,
 	VAU_WRITE_COMPLETE,

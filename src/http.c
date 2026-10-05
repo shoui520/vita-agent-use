@@ -76,6 +76,8 @@ static unsigned headers(struct vau_http_request *r)
 	static const char session[] = "POST /v1/session HTTP/1.1\r\n";
 	size_t pos;
 
+	/* pairing_only: 0 = command routes, 1 = pair only, 2 = session only,
+	 * 3 = admission (pair or session), narrowed here by the request line. */
 	if (r->pairing_only == 3) {
 		if (r->header_bytes >= sizeof(session) + 1 &&
 		    !memcmp(r->data, session, sizeof(session) - 1)) {
@@ -117,6 +119,12 @@ static unsigned headers(struct vau_http_request *r)
 		return 400;
 	}
 
+	/*
+	 * seen: 1 Host, 2 Content-Length, 4 Content-Type, 8 Authorization,
+	 * 16 Connection. Each may appear once. Framing comes from a single
+	 * Content-Length only: chunking, Expect, Upgrade and encodings are refused,
+	 * so no two parsers can ever disagree about where a request ends.
+	 */
 	unsigned seen = 0;
 
 	while (pos < r->header_bytes - 2) {

@@ -12,6 +12,8 @@
 #endif
 #include "sqlite_api.h"
 
+/* Raw SQLite result codes and the -65536 error encoding: see sqlite_api.h. */
+
 static const char *const install_fields[VAU_APP_INSTALL_FIELDS] = {
 	"_org_path",
 	"INSTALL_DIR_SAVEDATA",

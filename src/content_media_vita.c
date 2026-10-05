@@ -18,6 +18,7 @@ static int media_db_vita_loaded(void *ctx)
 
 	int rc = sceSysmoduleIsLoadedInternal(SCE_SYSMODULE_INTERNAL_DBUTIL);
 
+	/* SCE_SYSMODULE_ERROR_UNLOADED is the loader contract's "needs load", not a failure. */
 	return (uint32_t)rc == UINT32_C(0x805a1001) ? 1 : rc;
 }
 
@@ -270,6 +271,7 @@ struct readable_block {
 static int media_temp_vita_read_memory(void *context, uintptr_t address, void *out, size_t bytes)
 {
 	struct readable_block *cache = context;
+
 	if (!address || !bytes || bytes > UINT32_MAX || address > UINT32_MAX - bytes)
 		return VAU_DEVICE_ERROR;
 

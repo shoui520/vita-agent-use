@@ -123,6 +123,7 @@ struct pbp_region {
 static int read_region(void *context, uint64_t offset, void *data, uint32_t count)
 {
 	struct pbp_region *r = context;
+
 	if (offset > r->bytes || count > r->bytes - offset)
 		return VAU_INVALID;
 	return r->read(r->context, r->offset + offset, data, count);

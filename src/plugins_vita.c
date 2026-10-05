@@ -26,6 +26,7 @@ static int observe(const char *section, const char path[256], const struct proce
 	memset(state, 0, sizeof(*state));
 	*instances = 0;
 	if (!strcmp(section, "*KERNEL")) {
+		/* 0x10005 is the kernel process (taiHEN's KERNEL_PID), home of *KERNEL plugins. */
 		int rc = vauPluginState(0x10005, path, state);
 
 		if (rc >= 0)

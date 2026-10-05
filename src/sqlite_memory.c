@@ -105,6 +105,7 @@ struct sqlite_memory_methods {
 int vau_sqlite_memory_configure(void)
 {
 	static unsigned configured;
+
 	if (configured)
 		return 0;
 

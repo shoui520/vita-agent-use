@@ -43,8 +43,15 @@ static int poll_stop(struct vau_service *s)
 
 	int fault = !status.ready || status.observation_error;
 
-	/* A missed sample is temporary availability, not a physical stop or a
-	 * loss of saved trust. Actual stops still revoke every grant. */
+	/*
+	 * A missed sample is temporary availability, not a physical stop or a
+	 * loss of saved trust. Grants are revoked (and the local generation bumped)
+	 * when:
+	 *
+	 *   - the kernel stop generation moved, even if the chord was already released;
+	 *   - sampling just faulted while stopped, voiding any approval on screen;
+	 *   - a stop or held chord is seen while grants are still live.
+	 */
 	if (changed || (fault && !s->fault && s->auth.stopped) ||
 	    ((status.stopped || status.chord_held) && !s->auth.stopped)) {
 		vau_auth_stop(&s->auth);

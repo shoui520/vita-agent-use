@@ -20,6 +20,10 @@ static void release_frame(struct vau_connection *c)
 	c->binary_header = 0;
 }
 
+/*
+ * A frame response goes out in two parts without copying: the HTTP header from
+ * c->output up to binary_header, then the JPEG straight from the capture pool.
+ */
 const unsigned char *vau_connection_output(const struct vau_connection *c, size_t *size)
 {
 	if (!size)
@@ -88,6 +92,7 @@ int vau_connection_poll(struct vau_connection *c, struct vau_service *s, uint64_
 	                         ? VAU_CONNECTION_IDLE_US
 	                         : VAU_CONNECTION_MESSAGE_US;
 
+	/* Any physical stop since this connection opened ends it (generation check). */
 	if (now < c->last_us || now - c->started_us >= VAU_CONNECTION_LIFETIME_US ||
 	    now - c->phase_us >= limit || vau_service_transport_poll(s) < 0 ||
 	    c->generation != s->auth.stop_generation) {
@@ -95,6 +100,8 @@ int vau_connection_poll(struct vau_connection *c, struct vau_service *s, uint64_
 		return VAU_DENIED;
 	}
 
+	/* Streaming responses re-check their token on every poll, so a revocation
+	 * cuts a transfer off mid-stream instead of after it. */
 	c->last_us = now;
 	if (c->push_response && !vau_auth_lookup(&s->auth, c->push_token, VAU_TOKEN_HEX_BYTES, now)) {
 		vau_connection_close(c);
@@ -502,6 +509,7 @@ int vau_connection_feed(struct vau_connection *c, struct vau_service *s,
                 c->file_chunk.count, c->close_after_response ? "close" : "keep-alive",
                 c->file_offset, c->file_chunk.file_bytes, info->year, info->month, info->day,
                 info->hour, info->minute, info->second, info->microsecond);
+
 		if (header < 0 || (unsigned)header >= VAU_CONNECTION_HEADER_BYTES) {
 			vau_connection_close(c);
 
@@ -526,6 +534,7 @@ int vau_connection_feed(struct vau_connection *c, struct vau_service *s,
 		                  "X-Vita-Capture-Start: %" PRIu64 "\r\nX-Vita-Capture-End: %" PRIu64 "\r\n\r\n",
                 c->frame.jpeg_bytes, c->close_after_response ? "close" : "keep-alive", i->width,
                 i->height, i->process_id, i->started_us, i->finished_us);
+
 		if (n < 0 || (unsigned)n >= VAU_CONNECTION_HEADER_BYTES) {
 			vau_connection_close(c);
 
@@ -636,6 +645,7 @@ int vau_connection_written(struct vau_connection *c, struct vau_service *s, uint
  * enter the writer between replies. There is one TLS writer and no extra queue,
  * request arena, framebuffer copy, socket, or thread. Native producers stay
  * independent of this bounded 100ms drain. */
+/* Reads a counter back out of a batch this runtime just formatted itself. */
 static uint32_t push_counter(const char *json, const char *key)
 {
 	const char *p = strstr(json, key);
@@ -668,7 +678,17 @@ int vau_connection_push(struct vau_connection *c, struct vau_service *s,
 	if (!session || !session->push_enabled || !(session->rights & VAU_RIGHT_OBSERVE))
 		return 0;
 
-	unsigned slot = c->push_slot++ % 12; /* Dumps every 200ms, round-robin others. */
+	/*
+	 * One source per 100 ms tick, over a 12-tick (1.2 s) cycle:
+	 *
+	 *   even slots      coredump events   (every 200 ms, so crashes surface fast)
+	 *   1               dialog errors
+	 *   3               performance samples
+	 *   5, 7, 9, 11     log watch 0..3
+	 *
+	 * Sources with nothing new send nothing.
+	 */
+	unsigned slot = c->push_slot++ % 12;
 	char *body    = c->output + VAU_CONNECTION_HEADER_BYTES;
 	const char *kind;
 	int n = VAU_UNSUPPORTED;

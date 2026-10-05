@@ -192,6 +192,7 @@ int vau_vita_savedata_backup(unsigned user, const char *save, int (*stopped)(voi
 	struct vau_savedata_backup result = { 0 };
 	int rc = vau_file_stat(vau_vita_file_stat, NULL, root, &result.directory);
 
+	/* SCE_ERROR_ERRNO_ENOENT: no backup directory simply means nothing to report. */
 	if (rc == (int)UINT32_C(0x80010002))
 		return stopped(ctx) ? VAU_DENIED : VAU_OK;
 	if (rc)

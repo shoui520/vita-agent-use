@@ -22,6 +22,9 @@
  * Slot 3 is reserved for this runtime. ds4vita's examined revision uses slot 0.
  * The service must negotiate conflicts before enabling other input plugins. */
 #define INPUT_SLOT 3u
+
+/* Held emulation is set with a short native lifetime and lapses on its own if
+ * the worker stalls, so a running sequence re-asserts it this often. */
 #define REFRESH_US 8000u
 static struct vau_timeline timeline;
 static VauEvent staging[VAU_MAX_EVENTS];
@@ -49,6 +52,7 @@ static uint64_t now_us(void)
 	return (uint64_t)ksceKernelGetSystemTimeWide();
 }
 
+/* Syscalls are visible to every user process; only SceShell, which hosts the runtime, may call. */
 static int authorized(void)
 {
 	SceUID shell = ksceKernelSysrootGetShellPid();
@@ -277,6 +281,7 @@ static int enter(void)
 	return ksceKernelLockMutex(guard, 1, NULL);
 }
 
+/* Wakes the worker so a state change (new sequence, release) acts now, not at its next timeout. */
 static int leave(int rc)
 {
 	ksceKernelUnlockMutex(guard, 1);

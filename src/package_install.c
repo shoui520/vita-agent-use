@@ -717,6 +717,8 @@ static int extract_zip_data(SceUID input, SceOff data_offset, uint32_t compresse
 static int find_central_directory(SceUID file, SceOff file_size, uint32_t *offset,
                                   uint16_t *entry_count)
 {
+	/* The end-of-central-directory record (22 bytes) may be followed by a
+	 * comment of up to 65535 bytes, so it lies within the last 0x10016. */
 	size_t tail_size = file_size < 0x10016 ? (size_t)file_size : 0x10016;
 	uint8_t *tail    = malloc(tail_size);
 
@@ -732,7 +734,7 @@ static int find_central_directory(SceUID file, SceOff file_size, uint32_t *offse
 
 	result = INSTALL_ERROR_ARCHIVE;
 	for (size_t index = tail_size - 22;; index--) {
-		if (read_le32(tail + index) == 0x06054B50) {
+		if (read_le32(tail + index) == 0x06054B50) { /* "PK\5\6" */
 			uint16_t disk            = read_le16(tail + index + 4);
 			uint16_t central_disk    = read_le16(tail + index + 6);
 			uint16_t entries_on_disk = read_le16(tail + index + 8);
@@ -806,6 +808,7 @@ static int extract_vpk(const char *vpk_path)
 		uint32_t local_offset      = read_le32(central + 42);
 		SceOff next = cursor + sizeof(central) + name_size + extra_size + comment_size;
 
+		/* No encryption, multi-disk or ZIP64 (0xFFFFFFFF fields); only store/deflate. */
 		if ((flags & 1) || disk != 0 || name_size == 0 || name_size >= INSTALL_PATH_MAX / 2 ||
 		    compressed_size == 0xFFFFFFFF || uncompressed_size == 0xFFFFFFFF ||
 		    local_offset == 0xFFFFFFFF || (method != 0 && method != 8) || next > file_size) {
@@ -964,7 +967,7 @@ static int sfo_string(const void *buffer, size_t size, const char *key, char *va
 	const uint8_t *bytes    = (const uint8_t *)buffer;
 	const SfoHeader *header = (const SfoHeader *)buffer;
 
-	if (header->magic != 0x46535000 ||
+	if (header->magic != 0x46535000 || /* "\0PSF" */
 	    header->count > (size - sizeof(SfoHeader)) / sizeof(SfoEntry)) {
 		return INSTALL_ERROR_SFO;
 	}
