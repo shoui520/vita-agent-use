@@ -243,8 +243,7 @@ static int pair_once(void)
         if(rc<0) goto done;
         mbedtls_ssl_set_bio(&server.channel,&client,vau_net_send,vau_net_recv,NULL);
         ++connection_id;
-        rc=vau_vita_wake(NULL);
-        if(rc>=0) rc=vau_pairing_tls_init(&network.pairing,&server,&service,connection_id,now_us());
+        rc=vau_pairing_tls_init(&network.pairing,&server,&service,connection_id,now_us());
         if(rc>=0) vau_http_init_admission(&network.pairing.http);
         if(rc<0) { report("pairing start",rc); goto attempt_failed; }
         while(!network.pairing.request_ready && network.pairing.work!=VAU_TLS_CLOSED) {
@@ -261,7 +260,6 @@ static int pair_once(void)
             if(!peer_size || network.pairing.certificate_size!=peer_size ||
                 mbedtls_ct_memcmp(network.pairing.certificate,peer,peer_size)) rc=VAU_DENIED;
             if(rc>=0) memcpy(server.peer_fingerprint,network.pairing.binding.certificate_sha256,32);
-            if(rc>=0) rc=vau_vita_wake(NULL);
             if(rc>=0) rc=vau_vita_session_activate(&service,&network.pairing.binding,server.peer_fingerprint,
                 notifications.started ? &notifications : NULL,network.pairing.request.name,
                 network.pairing.request.name_length,now_us(),&resumed_grant);
@@ -280,7 +278,8 @@ static int pair_once(void)
         network.pairing.binding.replace_peer=peer_size &&
             (network.pairing.certificate_size!=peer_size ||
              mbedtls_ct_memcmp(network.pairing.certificate,peer,peer_size));
-        rc=vau_pairing_flow_init(&flow,&network.pairing,&ui);
+        rc=vau_vita_wake(NULL);
+        if(rc>=0) rc=vau_pairing_flow_init(&flow,&network.pairing,&ui);
         if(rc<0) goto attempt_failed;
         do {
             if(network.pairing.work==VAU_TLS_WAIT_READ || network.pairing.work==VAU_TLS_WAIT_WRITE) {

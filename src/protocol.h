@@ -51,6 +51,8 @@ struct vau_session {
  * on-device authorization may set rights; JSON never supplies them. Caller
  * serializes requests and creates a new session on reauthentication/reboot.
  * One cached response; older IDs are rejected rather than re-executed. */
+/* Validated event subscription only; never input or application commands. */
+int vau_protocol_background_request(const char *request,size_t length);
 void vau_session_init(struct vau_session *session, unsigned rights);
 /* Returns response byte count or a negative local error. Capacity must be at
  * least VAU_RESPONSE_BYTES, checked before any native effect. No network or

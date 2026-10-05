@@ -23,8 +23,8 @@ int vau_vita_pairing_activate(struct vau_service *service,int decision,
     uint64_t now_us,struct vau_pairing_grant *out);
 /* The owner calls only after strict TLS verified the locally saved peer.
  * Refuses any kernel stop generation since boot: reconnect cannot undo
- * PS+SELECT. The owner must wake the display and restore healthy sampling before
- * activation. Pairing identity remains saved regardless. */
+ * PS+SELECT. Saved-peer renewal is silent and permits temporary screen-off
+ * sampling unavailability; real commands restore full readiness before effects. */
 int vau_vita_session_activate(struct vau_service *service,
     const struct vau_pairing_binding *binding,const unsigned char saved_sha256[32],
     struct vau_notification_worker *notifications,const char *name,size_t length,

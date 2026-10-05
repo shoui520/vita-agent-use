@@ -17,7 +17,7 @@ int vau_grant_reply(struct vau_service *service,const struct vau_pairing_grant *
     size_t used=0,total=(size_t)(header_size+body_size); uint64_t start=io->clock(io->context); int result=VAU_OK;
     while(used<total) {
         uint64_t now=io->clock(io->context);
-        if(now<start || now-start>=UINT64_C(10000000) || vau_service_poll(service)<0 ||
+        if(now<start || now-start>=UINT64_C(10000000) || vau_service_transport_poll(service)<0 ||
             !vau_auth_lookup(&service->auth,grant->token,VAU_TOKEN_HEX_BYTES,now)) { result=VAU_DENIED; break; }
         int rc=mbedtls_ssl_write(io->channel,(unsigned char *)reply+used,total-used);
         if(rc==MBEDTLS_ERR_SSL_WANT_READ || rc==MBEDTLS_ERR_SSL_WANT_WRITE) {

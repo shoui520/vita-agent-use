@@ -8,10 +8,10 @@ static int same_binding(const struct vau_pairing_binding *a,const struct vau_pai
         a->kernel_stop_generation==b->kernel_stop_generation &&
         !memcmp(a->certificate_sha256,b->certificate_sha256,sizeof(a->certificate_sha256));
 }
-int vau_vita_pairing_activate(struct vau_service *s,int decision,
+static int activate(struct vau_service *s,int decision,
     const struct vau_pairing_binding *approval,const struct vau_pairing_binding *current,
     struct vau_notification_worker *notifications,const char *name,size_t length,
-    uint64_t now,struct vau_pairing_grant *out)
+    uint64_t now,struct vau_pairing_grant *out,int resume)
 {
     if (!out) return VAU_INVALID;
     memset(out,0,sizeof(*out));
@@ -21,22 +21,26 @@ int vau_vita_pairing_activate(struct vau_service *s,int decision,
     uint16_t label[VAU_AGENT_NAME_BYTES]; size_t units;
     int rc=vau_agent_name_utf16(label,&units,name,length);
     if (rc<0 || now>UINT64_MAX-VAU_PAIRING_GRANT_US) return rc<0 ? rc : VAU_INVALID;
-    if (notifications && (notifications->service!=s || !notifications->initialized ||
+    if (!resume && notifications && (notifications->service!=s || !notifications->initialized ||
         !notifications->started || atomic_load_explicit(&notifications->stopping,memory_order_acquire) ||
         atomic_load_explicit(&notifications->exited,memory_order_acquire))) return VAU_INVALID;
     (void)vau_service_poll(s);
-    if (!s->valid || !s->stop.ready || s->stop.chord_held || s->stop.observation_error) return VAU_DENIED;
+    if (!s->valid || s->stop.chord_held ||
+        (resume ? (s->stop.stopped || s->stop.generation) : (!s->stop.ready || s->stop.observation_error))) return VAU_DENIED;
     if (s->input.initialized && s->input.cleanup) return VAU_BUSY;
     if (approval->local_stop_generation!=s->auth.stop_generation ||
         approval->kernel_stop_generation!=s->stop.generation) return VAU_STALE;
-    /* Native OK is the consent decision. No extra controller sampling. */
+    /* Physical pairing uses native OK; saved-peer transport does not inject input. */
     rc=vauInputSetApprovalGate(0);
     if (rc<0) goto failed;
     if (s->auth.stopped) {
-        rc=vau_service_rearm(s,approval->local_stop_generation,approval->kernel_stop_generation);
+        rc=resume ? vau_auth_rearm(&s->auth,approval->local_stop_generation) :
+            vau_service_rearm(s,approval->local_stop_generation,approval->kernel_stop_generation);
         if (rc<0) goto failed;
     }
-    rc=vau_service_grant(s,VAU_RIGHT_OBSERVE|VAU_RIGHT_CONTROL,now,
+    rc=resume ? vau_auth_grant(&s->auth,VAU_RIGHT_OBSERVE|VAU_RIGHT_CONTROL,now,
+        VAU_PAIRING_GRANT_US,vau_vita_entropy,NULL,&out->handle,out->token) :
+        vau_service_grant(s,VAU_RIGHT_OBSERVE|VAU_RIGHT_CONTROL,now,
         VAU_PAIRING_GRANT_US,vau_vita_entropy,NULL,&out->handle,out->token);
     if (rc<0) goto failed;
     struct vau_session *session=vau_auth_lookup(&s->auth,out->token,64,now);
@@ -48,10 +52,10 @@ int vau_vita_pairing_activate(struct vau_service *s,int decision,
     }
     session->subject[64]=0;
     memcpy(session->agent_name,name,length);session->agent_name[length]=0;
-    rc=vau_service_poll(s);
+    rc=resume ? vau_service_transport_poll(s) : vau_service_poll(s);
     if (rc<0 || approval->local_stop_generation!=s->auth.stop_generation ||
         approval->kernel_stop_generation!=s->stop.generation) { rc=VAU_STALE; goto failed; }
-    if (notifications)
+    if (notifications && !resume)
         out->notification_result=vau_notification_worker_queue(notifications,out->handle,name,length,now);
     return VAU_OK;
 failed:
@@ -62,6 +66,14 @@ failed:
     (void)vau_service_poll(s);
     memset(out,0,sizeof(*out)); out->notification_result=VAU_UNSUPPORTED;
     return rc;
+}
+
+int vau_vita_pairing_activate(struct vau_service *s,int decision,
+    const struct vau_pairing_binding *approval,const struct vau_pairing_binding *current,
+    struct vau_notification_worker *notifications,const char *name,size_t length,
+    uint64_t now,struct vau_pairing_grant *out)
+{
+    return activate(s,decision,approval,current,notifications,name,length,now,out,0);
 }
 
 int vau_vita_session_activate(struct vau_service *s,
@@ -75,9 +87,9 @@ int vau_vita_session_activate(struct vau_service *s,
         memcmp(binding->certificate_sha256,saved_sha256,32)) return VAU_DENIED;
     (void)vau_service_poll(s);
     /* Persistent consent permits normal reconnect, never clearing a physical
-     * stop or monitor fault. A reboot starts a new kernel stop generation. */
-    if (!s->valid || !s->stop.ready || s->stop.stopped || s->stop.generation ||
-        binding->kernel_stop_generation || s->stop.chord_held || s->stop.observation_error)
+     * stop. Input stays unavailable until healthy sampling returns. */
+    if (!s->valid || s->stop.stopped || s->stop.generation ||
+        binding->kernel_stop_generation || s->stop.chord_held)
         return VAU_DENIED;
-    return vau_vita_pairing_activate(s,VAU_OK,binding,binding,notifications,name,length,now,out);
+    return activate(s,VAU_OK,binding,binding,notifications,name,length,now,out,1);
 }

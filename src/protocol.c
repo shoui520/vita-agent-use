@@ -903,6 +903,17 @@ static int request_locked(struct vau_session *s, const struct vau_native_api *ap
     return n;
 }
 
+/* Only the fully validated event subscription is background maintenance.
+ * Reuse the existing bounded parser workspace; no client-supplied bypass flag. */
+int vau_protocol_background_request(const char *request,size_t length)
+{
+    if(!request || atomic_flag_test_and_set_explicit(&workspace_busy,memory_order_acquire))return 0;
+    int rc=parse(request,length,&workspace.command,workspace.tokens);
+    int background=rc==VAU_OK && workspace.command.operation==OP_SUBSCRIBE;
+    atomic_flag_clear_explicit(&workspace_busy,memory_order_release);
+    return background;
+}
+
 int vau_protocol_request(struct vau_session *s,const struct vau_native_api *api,
     const char *request,size_t length,char *response,size_t capacity)
 {

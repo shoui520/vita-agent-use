@@ -64,7 +64,7 @@ int vau_command_worker_init(struct vau_command_worker *w,struct vau_service *s,
     memset(w,0,sizeof(*w));
     w->service=s; w->api=api; w->server=server; w->initialized=1;
     vau_net_socket_init(&w->listener); vau_net_socket_init(&w->client); vau_net_waiter_init(&w->waiter);
-    int rc=vau_service_poll(s);
+    int rc=vau_service_transport_poll(s);
     if(rc>=0 && !live_grant(s,api->clock(api->context)))rc=VAU_EXPIRED;
     if (rc>=0) rc=vau_net_waiter_open(&w->waiter);
     if (rc>=0) rc=vau_net_listen(&w->listener,port);

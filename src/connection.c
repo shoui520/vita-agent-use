@@ -231,13 +231,16 @@ int vau_connection_feed(struct vau_connection *c, struct vau_service *s,
     }
     /* Only a framed request with a live token may wake a display. Inactive
      * transport is not permission to execute commands with an unhealthy monitor. */
-    if(vau_service_poll(s)<0) {
+    int background=!c->request.frame_request && !c->request.file_read_request &&
+        !c->request.audit_request && !c->request.upload_request &&
+        vau_protocol_background_request(c->request.data+c->request.header_bytes,c->request.body_bytes);
+    if(!background && vau_service_poll(s)<0) {
         struct vau_session *session=vau_auth_lookup(&s->auth,c->request.token,VAU_TOKEN_HEX_BYTES,api->clock(api->context));
         if(!session || !api->wake || api->wake(api->context)<0 || vau_service_poll(s)<0) {
             vau_connection_close(c);return VAU_DENIED;
         }
     }
-    if(s->activity) {
+    if(!background && s->activity) {
         uint64_t activity_us=api->clock(api->context);
         struct vau_session *active=vau_auth_lookup(&s->auth,c->request.token,VAU_TOKEN_HEX_BYTES,activity_us);
         if(active && (active->rights&VAU_RIGHT_CONTROL) && active->agent_name[0])

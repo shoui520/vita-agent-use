@@ -18,9 +18,9 @@ static int monitor(struct vau_service *s,int trusted)
     if (!s) return 0;
     (void)vau_service_poll(s);
     /* Authenticate a saved PC even when the screen-off Ctrl mask is absent.
-     * No control grant is issued here; the owner wakes and checks readiness. */
+     * Actual pairing/control still require wake and full readiness. */
     return s->valid && !s->stop.chord_held && (trusted ?
-        !s->stop.stopped && !s->stop.generation : s->stop.ready && !s->stop.observation_error);
+        !s->stop.stopped && !s->stop.generation : 1);
 }
 static int initialize(struct vau_pairing_tls *p,struct vau_tls_server *server,
     struct vau_service *s,uint64_t connection,uint64_t now,int trusted)

@@ -154,7 +154,10 @@ int vau_service_request(struct vau_service *s, const struct vau_native_api *api,
                          char *response, size_t capacity, unsigned *http_status)
 {
     if (!s || !api) return VAU_INVALID;
-    int available=vau_service_poll(s);
+    int background=request && request->state==VAU_HTTP_READY && !request->pairing_only &&
+        !request->frame_request && !request->file_read_request && !request->audit_request && !request->upload_request &&
+        vau_protocol_background_request(request->data+request->header_bytes,request->body_bytes);
+    int available=background ? vau_service_transport_poll(s) : vau_service_poll(s);
     if(available<0 && !s->auth.stopped) {
         if(!response || !http_status || !capacity)return VAU_INVALID;
         *http_status=503;
