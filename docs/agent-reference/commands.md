@@ -27,6 +27,7 @@ Pairing accepts one trusted PC identity at a time. A second identity requires na
 ## screen
 
 - **screen on**: display on. Acceptance does not mean a frame is ready.
+- Automatic cleanup with `screen_off_when_done: true` checks `app.running` first. Any running/suspended app keeps the display on across subsequent commands. After closing the app, cleanup turns it off once the native inventory is empty. If inventory fails, it leaves the display on and reports the cleanup error. This applies to standalone commands, `serve`, and run completion (including `close_on_completion: false`).
 - **screen off**: display off, clears cached listing resources, ends screen ownership; does not suspend. Never use while a dump is finalizing. Do not toggle power repeatedly to fix failures.
 - **screen capture** `--output NEW.jpg`: a fresh, corrected JPEG at the real framebuffer size (up to 960×544). Returns width, height, process, timing and bytes. Not added to Photos. The parent directory must exist and the output must not exist or be a symlink. `frame_unavailable` / `SCE_DISPLAY_ERROR_NO_PIXEL_DATA` is a genuine failure: wait for rendering and capture to a new file. Never substitute an old image.
 

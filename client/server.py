@@ -21,7 +21,7 @@ import sys
 import threading
 import time
 import uuid
-from vita_client import ClientError, NativeFrameError, UploadError, VitaClient, durable_json, private_json, strict_json
+from vita_client import ClientError, NativeFrameError, UploadError, VitaClient, durable_json, private_json, strict_json, screen_off_if_idle
 
 IPC_IDLE_TIMEOUT = 65
 MAX_IPC = 1024 * 1024
@@ -348,7 +348,7 @@ class RunCoordinator:
                     try:checked(c.call('run.end',{'run_id':run['run_id'],'phase':phase}))
                     except Exception as exc:cleanup.append(str(exc))
                 if self.server.screen_off_when_done:
-                    try:checked(c.call('screen.off'))
+                    try:screen_off_if_idle(c)
                     except Exception as exc:cleanup.append(str(exc))
             if not self.server.connected and phase=='completed':phase='connection_lost';error='Connection lost during cleanup; final state is uncertain.'
             elif cleanup and phase=='completed':phase='failed';error='Run completed but cleanup failed.'
@@ -542,7 +542,7 @@ class AgentServer:
                     cleanup=self.screen_off_when_done and not self.runs.busy() and getattr(options,'op',None)!='system.reboot' and not (options.group=='screen' and options.action in ('on','off'))
                     if cleanup and (not failed or (self.connected and self._pending() is None)):
                         try:
-                            checked(self.client.call('screen.off'));self.last_activity=time.monotonic()
+                            screen_off_if_idle(self.client);self.last_activity=time.monotonic()
                         except Exception as exc:
                             if not failed:raise
                             self.event({'type':'command.cleanup_failed','message':str(exc)})

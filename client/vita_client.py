@@ -30,6 +30,20 @@ class ClientError(Exception):
     pass
 
 
+def screen_off_if_idle(client):
+    """Applications retain the display until native termination is observed."""
+    reply=client.call('app.running')
+    result=reply.get('result')
+    if reply.get('status')!='ok' or not isinstance(result,dict) or not isinstance(result.get('entries'),list):
+        raise ClientError('Cannot confirm app termination; automatic screen-off withheld.')
+    if result['entries']:
+        return False
+    reply=client.call('screen.off')
+    if reply.get('status') not in ('accepted','ok'):
+        raise ClientError('Screen-off was rejected.')
+    return True
+
+
 class UploadError(ClientError):
     """Upload failure with confirmed progress, never an inferred remote outcome."""
     def __init__(self, message, progress):
@@ -435,9 +449,7 @@ class VitaClient:
         had_error = sys.exc_info()[0] is not None
         try:
             if self._screen_owned and self.screen_off_when_done:
-                reply = self._call_raw('screen.off', {})
-                if reply.get('status') != 'accepted':
-                    raise ClientError('Screen-off was rejected.')
+                screen_off_if_idle(self)
         except Exception as exc:
             self._screen_cleanup_error = exc
             if not had_error:
