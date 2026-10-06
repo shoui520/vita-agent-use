@@ -4,8 +4,6 @@
 
 vita-agent-use is like computer use for AI agents, but for a PS Vita. An agent such as Claude, Codex or Gemini can see the screen, press buttons, touch the screen, launch apps, move files and watch for crashes. It is built for agentic PS Vita development: the agent builds your homebrew, deploys it, launches it, plays it, reads the logs and crash dumps, then fixes the code and does it again, without you touching the console.
 
-It **replaces [VitaCompanion](https://github.com/devnoname120/vitacompanion)** with an authenticated, auditable control channel designed for agents.
-
 ## What the agent can do
 
 | | |
@@ -33,7 +31,7 @@ You stay in control of your console:
 ```
 ┌──────────── PC ─────────────┐        TLS        ┌────────────── PS Vita ──────────────┐
 │ AI agent                    │                   │ vita_agent_loader.suprx  (*main)    │
-│   └─ client/vita_agent.py   │ ◀───────────────▶ │   └─ vita_agent_shell.suprx         │
+│   └─ client/vita_agent.py   │ ◀───────────────▶│   └─ vita_agent_shell.suprx         │
 │        └─ serve (events)    │  commands/events  │ vita_agent_kernel.skprx  (*KERNEL)  │
 └─────────────────────────────┘                   └─────────────────────────────────────┘
 ```
@@ -43,7 +41,7 @@ You stay in control of your console:
 
 ## Requirements
 
-- A PS Vita or PS TV with HENkaku/Ensō and taiHEN
+- A PS Vita on 3.65
 - [VitaShell](https://github.com/TheOfficialFloW/VitaShell), used for setup over FTP and as the recovery copy that guarded config edits require
 - A PC with Python 3 and the [`cryptography`](https://pypi.org/project/cryptography/) package
 - To build the plugin yourself: [VitaSDK](https://vitasdk.org), CMake and the [Mbed TLS](https://github.com/Mbed-TLS/mbedtls) 3.6.7 source
@@ -105,7 +103,7 @@ That's it. Now point your agent at this repository.
 
 | Plugin | Status |
 |---|---|
-| **VitaCompanion** | ❌ Incompatible; disable it (vita-agent-use replaces it) |
+| **Vitacompanion** | ❌ Incompatible.  |
 | BGFTP | ⚠️ Not recommended alongside |
 | catlog | ⚠️ Not recommended alongside |
 | kvdb | ⚠️ Not recommended alongside |
@@ -131,6 +129,15 @@ The agent can also use these tools when profiling or debugging:
 - [psp2_core_parse](https://github.com/shoui520/psp2_core_parse): analyze app crash dumps
 - [psp2_gpucrash_parse](https://github.com/shoui520/psp2_gpucrash_parse): analyze GPU crash dumps
 - [psp2_err](https://github.com/shoui520/psp2_err): look up error codes offline
+
+## Credits
+
+* Codex & Claude
+* https://github.com/devnoname120/vitacompanion - for app launch and screen on/off code
+* https://github.com/isage/catlog - for kernel and user logging
+* https://github.com/Electry/PSVshell - for cpu fps and mem metrics
+* https://github.com/TeamFAPS/PSVita-RE-tools - for decryption and logging
+* https://github.com/TheOfficialFloW/VitaShell - for promoter code
 
 ## License
 
