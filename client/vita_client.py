@@ -30,8 +30,23 @@ class ClientError(Exception):
     pass
 
 
+def connection_refused_message():
+    return ('Vita refused the connection. It may still hold an active session from this PC after serve stopped. '
+            'Start serve to reuse the saved session, or wait for that session to expire. '
+            'Also check the Vita is awake, its IP is correct, and the plugin is running. '
+            'Keep the saved identity, credentials and recovery state.')
+
+
 def screen_off_if_idle(client):
-    """Applications retain the display until native termination is observed."""
+    """Leave the display on until applications and outstanding work are idle."""
+    busy=getattr(client,'automatic_screen_busy',None)
+    if busy is not None and busy():
+        return False
+    installs=getattr(client,'_screen_installs',set())
+    for operation_id in list(installs):
+        reply=client.call('app.install.status',{'operation_id':operation_id})
+        if reply.get('status')!='ok' or reply.get('result',{}).get('running') is not False:
+            return False
     reply=client.call('app.running')
     result=reply.get('result')
     if reply.get('status')!='ok' or not isinstance(result,dict) or not isinstance(result.get('entries'),list):
@@ -39,6 +54,10 @@ def screen_off_if_idle(client):
     if result['entries']:
         return False
     reply=client.call('screen.off')
+    if reply.get('status')=='error' and reply.get('error',{}).get('code')==-2:
+        # The native worker is still busy. This is deferred cleanup, not an
+        # installation failure, and must not replace the command's result.
+        return False
     if reply.get('status') not in ('accepted','ok'):
         raise ClientError('Screen-off was rejected.')
     return True
@@ -480,6 +499,9 @@ class VitaClient:
             certificate = connection.sock.getpeercert(binary_form=True)
             if not certificate or not hmac.compare_digest(hashlib.sha256(certificate).hexdigest(), self.pin):
                 raise ClientError('Device certificate does not match the paired fingerprint; no token sent.')
+        except ConnectionRefusedError as exc:
+            connection.close()
+            raise ConnectionRefusedError(connection_refused_message()) from exc
         except BaseException:
             connection.close()
             raise
@@ -969,6 +991,14 @@ class VitaClient:
                 # Persist the exact command before any possible remote effect.
                 durable_json(self.path, state)
             result = self._finish(state)
+            if op in ('app.install','app.install.status') and result.get('status')=='ok':
+                operation_id=command['args'].get('operation_id')
+                installs=getattr(self,'_screen_installs',set())
+                if result.get('result',{}).get('running') is False:
+                    installs.discard(operation_id)
+                else:
+                    installs.add(operation_id)
+                self._screen_installs=installs
             self._track_screen_reply(op,result)
             return result
 

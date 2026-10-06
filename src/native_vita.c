@@ -65,6 +65,26 @@ static int display(void *ctx, int on)
 {
 	(void)ctx;
 	if (!on) {
+		/* An empty app inventory does not mean Shell's async workers are idle. */
+		if (content_busy(ctx) || vau_vita_approval_pending(ctx))
+			return VAU_BUSY;
+
+		int busy = vau_vita_performance_busy();
+
+		if (busy)
+			return busy < 0 ? busy : VAU_BUSY;
+
+		VauStatus status = { 0 };
+		int rc           = vauInputGetStatus(&status);
+
+		if (rc < 0)
+			return rc;
+		if (status.size != sizeof(status) || status.abi != VAU_ABI)
+			return VAU_DEVICE_ERROR;
+		if (status.state == VAU_QUEUED || status.state == VAU_RUNNING ||
+		    status.lease_until_us > clock_us(ctx))
+			return VAU_BUSY;
+
 		(void)vau_vita_file_list_reset();
 		(void)vau_content_legacy_reset();
 	}

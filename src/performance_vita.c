@@ -181,3 +181,19 @@ void vau_performance_stop(void)
 	sceKernelSetEventFlag(wake, 1);
 	sceKernelUnlockMutex(guard, 1);
 }
+
+int vau_vita_performance_busy(void)
+{
+	if (guard < 0)
+		return 0;
+
+	int rc = sceKernelLockMutex(guard, 1, NULL);
+
+	if (rc < 0)
+		return rc;
+
+	int active = watch.active;
+
+	rc = sceKernelUnlockMutex(guard, 1);
+	return rc < 0 ? rc : active;
+}

@@ -100,7 +100,15 @@ def pair_locked(resume=False, *, host=None, agent_name=None, timeout=75):
         body=json.dumps(dict(v=1,agent_name=config['agent_name']),separators=(',',':')).encode()
         connection.request('POST','/v1/session' if resume else '/v1/pair',body=body,headers={'Content-Type':'application/json','Connection':'close'})
         response=connection.getresponse(); data=response.read(1025)
-        if response.status!=200 or len(data)>1024: raise ClientError('Saved-peer session rejected.' if resume else 'Pairing rejected.')
+        if response.status!=200 or len(data)>1024:
+            if response.status==403 and len(data)<=1024:
+                try:
+                    failure=json.loads(data)
+                except (ValueError,UnicodeError):
+                    failure={}
+                if isinstance(failure,dict) and failure.get('error')=='identity_not_paired':
+                    raise ClientError('This PC identity is not paired. Run session pair and tap OK on the Vita once. Other approved identities are retained.')
+            raise ClientError('Saved-peer session rejected.' if resume else 'Pairing rejected.')
         result=json.loads(data)
         token=result.get('token','')
         if len(token)!=64 or any(c not in '0123456789abcdef' for c in token): raise ClientError('Invalid grant response.')
@@ -126,12 +134,17 @@ def pair_locked(resume=False, *, host=None, agent_name=None, timeout=75):
     except ssl.SSLError as exc:
         if getattr(exc,'reason',None)=='TLSV1_ALERT_UNKNOWN_CA' or 'TLSV1_ALERT_UNKNOWN_CA' in str(exc):
             raise ClientError(
-                'Vita rejected this PC certificate (TLS unknown CA). The plugin trusts only one PC identity; '
-                'The installed plugin may predate native replacement pairing. Update the Shell plugin '
-                'to request replacement with physical OK; see docs/agent-reference/recovery.md. '
+                'Vita rejected this PC certificate (TLS unknown CA). The installed plugin may predate multi-identity pairing. '
+                'Update the Shell plugin, then use session pair to approve this identity; other approvals are retained. '
                 'The trusted peer name/fingerprint is unavailable from this rejected handshake.'
             ) from exc
         raise
+    except TimeoutError as exc:
+        raise ClientError(
+            'Pairing/session connection timed out. Another PC server may still own the command connection; '
+            'finish its work and stop that serve process, then retry. The Vita keeps every approved identity. '
+            'If no server is active, check the Vita IP and connectivity. Do not delete pairing files.'
+        ) from exc
     finally: connection.close()
 
 def wait_for_commands(credentials,timeout=15,*,screen_off_when_done=True):

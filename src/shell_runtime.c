@@ -12,6 +12,7 @@
 #include "diagnostics_vita.h"
 #include "writes_vita.h"
 #include "package_install.h"
+#include "peer_store.h"
 #include "acl_vita.h"
 #include "content_runtime.h"
 #include "native_ops.h"
@@ -267,6 +268,12 @@ static int load_identity(void)
 	if ((uint32_t)rc != UINT32_C(0x80010002))
 		return rc;
 
+	rc = sceIoGetstat(ROOT "peers", &stat);
+	if (rc >= 0)
+		return VAU_INVALID;
+	if ((uint32_t)rc != UINT32_C(0x80010002))
+		return rc;
+
 	rc = vau_tls_generate_identity(&server, certificate, &certificate_size, key, &key_size,
 	                               vau_vita_entropy, NULL, fatal_crypto);
 	log_event("identity generated", rc, 0);
@@ -297,67 +304,13 @@ static int load_identity(void)
 	return rc;
 }
 
-/*
- * Replaces the trusted peer certificate: write peer.der.tmp, move peer.der
- * aside to peer.previous.der, then rename the new file into place. A failure
- * restores the previous file; a crash between the renames is repaired at boot.
- */
+/* Each physical approval adds one certificate without replacing other PCs. */
 static int store_peer(void)
 {
-	int fd = sceIoOpen(ROOT "peer.der.tmp", SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0666);
+	int rc = vau_peer_save(network.pairing.certificate, network.pairing.certificate_size);
 
-	if (fd < 0)
-		return fd;
-
-	size_t written = 0;
-	int rc         = 0;
-
-	while (written < network.pairing.certificate_size) {
-		int n = sceIoWrite(fd, network.pairing.certificate + written,
-		                   network.pairing.certificate_size - written);
-
-		if (n <= 0) {
-			rc = n < 0 ? n : VAU_DEVICE_ERROR;
-			break;
-		}
-
-		written += (size_t)n;
-	}
-
-	if (rc >= 0)
-		rc = sceIoSyncByFd(fd, 0);
-
-	int closed = sceIoClose(fd);
-
-	if (closed < 0)
-		rc = closed;
-
-	int retained = 0;
-
-	if (rc >= 0 && peer_size) {
-		/* Keep the approved old peer until the replacement has been installed.
-		 * Startup restores it if power is lost between these two renames. */
-		SceIoStat previous = { 0 };
-		int exists         = sceIoGetstat(ROOT "peer.previous.der", &previous);
-
-		if (exists >= 0)
-			rc = sceIoRemove(ROOT "peer.previous.der");
-		else if ((uint32_t)exists != UINT32_C(0x80010002))
-			rc = exists;
-		if (rc >= 0) {
-			rc       = sceIoRename(ROOT "peer.der", ROOT "peer.previous.der");
-			retained = rc >= 0;
-		}
-	}
-
-	if (rc >= 0)
-		rc = sceIoRename(ROOT "peer.der.tmp", ROOT "peer.der");
-	if (rc < 0 && retained) {
-		int restored = sceIoRename(ROOT "peer.previous.der", ROOT "peer.der");
-
-		if (restored < 0)
-			log_event("previous peer restore failed", restored, 0);
-	}
+	if (rc < 0)
+		log_event(vau_peer_store_stage(), rc, 0);
 
 	if (rc >= 0) {
 		peer_size = network.pairing.certificate_size;
@@ -372,8 +325,9 @@ static void close_pair_sockets(void)
 	/* Retain ownership if native detach/destroy fails; never reuse those fds. */
 	if (vau_net_waiter_close(&waiter) < 0)
 		stop_runtime("network cleanup stopped", waiter.error ? waiter.error : VAU_DEVICE_ERROR);
+
 	vau_net_close(&client);
-	vau_net_close(&listener);
+	/* Keep admission listening while the command worker owns the TLS arena. */
 }
 
 static void stop_runtime(const char *stage, int result)
@@ -413,6 +367,37 @@ static int token_reply(const struct vau_pairing_grant *grant)
 	return vau_grant_reply(&service, grant, COMMAND_PORT, &io);
 }
 
+static void unpaired_reply(void)
+{
+	static const char body[] =
+	        "{\"status\":\"error\",\"error\":\"identity_not_paired\","
+	        "\"message\":\"Run session pair and approve this identity on the Vita.\"}";
+	char reply[384];
+	int size = vau_snprintf(reply, sizeof(reply),
+	                        "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\n"
+	                        "Content-Length: %u\r\nConnection: close\r\n\r\n%s",
+	                        (unsigned)(sizeof(body) - 1), body);
+
+	if (size <= 0 || (size_t)size >= sizeof(reply))
+		return;
+
+	size_t sent      = 0;
+	uint64_t started = now_us();
+
+	while (sent < (size_t)size && now_us() - started < UINT64_C(2000000)) {
+		int rc = mbedtls_ssl_write(&server.channel, (unsigned char *)reply + sent, size - sent);
+
+		if (rc > 0) {
+			sent += rc;
+		} else if (rc == MBEDTLS_ERR_SSL_WANT_READ || rc == MBEDTLS_ERR_SSL_WANT_WRITE) {
+			if (reply_wait(NULL, rc == MBEDTLS_ERR_SSL_WANT_WRITE) < 0)
+				break;
+		} else {
+			break;
+		}
+	}
+}
+
 static int pair_once(void)
 {
 	/* Admission proves certificate possession but grants no trust. Sessions
@@ -424,12 +409,15 @@ static int pair_once(void)
 	if (rc < 0)
 		return rc;
 
-	vau_net_socket_init(&listener);
 	vau_net_socket_init(&client);
 	vau_net_waiter_init(&waiter);
 	rc = vau_net_waiter_open(&waiter);
-	if (rc >= 0)
+	if (rc >= 0 && listener.fd < 0) {
 		rc = vau_net_listen(&listener, PAIR_PORT);
+		if (rc < 0)
+			vau_net_close(&listener);
+	}
+
 	if (rc < 0)
 		goto done;
 
@@ -497,11 +485,22 @@ static int pair_once(void)
 			goto attempt_failed;
 		}
 
-		if (network.pairing.http.pairing_only == 2) {
-			/* A session request never creates a prompt or changes peer trust. */
-			if (!peer_size || network.pairing.certificate_size != peer_size ||
-			    mbedtls_ct_memcmp(network.pairing.certificate, peer, peer_size)) {
-				rc = VAU_DENIED;
+		int trusted = vau_peer_match(network.pairing.certificate, network.pairing.certificate_size);
+
+		if (trusted < 0) {
+			rc = trusted;
+			report("saved peer invalid", rc);
+			goto attempt_failed;
+		}
+
+		if (network.pairing.http.pairing_only == 2 || trusted) {
+			/* Repeated pairing of an approved identity is a silent reconnect. */
+			rc = trusted ? VAU_OK : VAU_DENIED;
+			if (!trusted)
+				unpaired_reply();
+			if (trusted) {
+				peer_size = network.pairing.certificate_size;
+				memcpy(peer, network.pairing.certificate, peer_size);
 			}
 
 			if (rc >= 0)
@@ -537,9 +536,6 @@ static int pair_once(void)
 			goto attempt_failed;
 		}
 
-		network.pairing.binding.replace_peer =
-		        peer_size && (network.pairing.certificate_size != peer_size ||
-		                      mbedtls_ct_memcmp(network.pairing.certificate, peer, peer_size));
 		rc = vau_vita_wake(NULL);
 		if (rc >= 0)
 			rc = vau_pairing_flow_init(&flow, &network.pairing, &ui);
@@ -603,6 +599,7 @@ static int runtime_thread(SceSize args, void *argp)
 {
 	(void)args;
 	(void)argp;
+	vau_net_socket_init(&listener);
 	(void)vau_diagnostics_start();
 
 	SceIoStat directory_stat = { 0 };
@@ -662,6 +659,16 @@ static int runtime_thread(SceSize args, void *argp)
 		return 0;
 	}
 
+	/* Migrate the currently trusted legacy identity once; retain the old file. */
+	if (peer_size) {
+		rc = vau_peer_save(peer, peer_size);
+		if (rc < 0) {
+			log_event(vau_peer_store_stage(), rc, 0);
+			report("saved peer invalid", rc);
+			return 0;
+		}
+	}
+
 	{
 		char result[3500];
 		int events = vau_vita_native_api.events
@@ -708,10 +715,31 @@ static int runtime_thread(SceSize args, void *argp)
 				(void)vau_command_worker_attach_notifications(&network.commands, &notifications);
 			network.commands.trace = network_event;
 			report("commands listening", COMMAND_PORT);
+			vau_net_waiter_init(&waiter);
+			rc = vau_net_waiter_open(&waiter);
+			if (rc < 0)
+				stop_runtime("network cleanup stopped", rc);
+
 			while (network.commands.running) {
+				/* A new pairing/session connection waits in the listener backlog
+				 * until the current command connection and native work release it.
+				 * This reuses the existing TLS arena and preserves live operations. */
+				if (!network.commands.connected && !vau_vita_install_busy() &&
+				    !vau_vita_content_inflight()) {
+					int waiting = vau_net_wait(&waiter, &listener, 0, 0);
+
+					if (waiting < 0)
+						stop_runtime("network cleanup stopped", waiting);
+					if (waiting > 0)
+						break;
+				}
+
 				prevent_auto_suspend();
 				(void)vau_command_worker_step(&network.commands);
 			}
+
+			if (vau_net_waiter_close(&waiter) < 0)
+				stop_runtime("network cleanup stopped", waiter.error);
 
 			rc = network.commands.error;
 

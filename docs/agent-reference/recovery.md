@@ -29,10 +29,10 @@ Large negative numbers are Sony codes, not these. Keep both the signed decimal a
 | Server socket missing | Start `serve` with the same state directory. |
 | Socket exists but connection refused | An unclean exit can leave a stale socket. Confirm no process owns the lock, then restart `serve` (it removes the stale socket). Never start duplicates or delete live state. |
 | `connected:false` | Keep `connection_error`. Check the network and IP, run one diagnostics query, and inspect the grant and any pending command. |
-| 8847 refused but 8848 active | An existing session owns the service; use its server instead of re-pairing. |
+| 8847 refused but 8848 active | This can occur on older builds. The multi-identity build keeps admission listening. Finish work and stop the current `serve` before switching identities; keep credentials and recovery state. |
 | Command port refused right after reconnect or reboot | The listener isn't ready yet. Let the existing readiness/reconnect logic handle it; do not hammer the port. |
 | Timeout, reset or truncated response | The command may have run. Recover the exact pending request before doing anything else with effects; check the journal, diagnostics and current task. |
-| TLS unknown CA during pairing/session connect | This PC certificate was rejected. The Vita accepts only one saved peer; a second identity cannot reach the approval dialog. Reuse the trusted identity or have the human follow the peer replacement below. The rejected TLS handshake cannot expose the trusted peer name/fingerprint. |
+| TLS unknown CA during pairing/session connect | This PC certificate was rejected. Older Shell builds accept only one peer; update to the multi-identity build and use `session pair` for each new identity. Do not delete existing trust. A rejected handshake cannot expose the trusted peer name/fingerprint. |
 | TLS pin mismatch | Stop. Check whether the IP or device is wrong, or the identity was deliberately reset. Never disable pinning or send tokens to the unexpected device. Re-pair only as a deliberate reset with human approval. |
 | HTTP 401 or expired grant | Normal expiry: `session connect` or a server reconnect. If the human stopped access, respect that. |
 | Failed read-only request under `serve` | The server can recover observations automatically; snapshots and filesystem/app listings or stats retry once after renewing a lost session. If renewal fails, keep the error and state and retry after `server status` becomes connected. Writes/input/app control are never automatically resubmitted with a new ID. |
@@ -62,18 +62,18 @@ Large negative numbers are Sony codes, not these. Keep both the signed decimal a
 | Service dead but Vita usable | One UDP diagnostics query, plus the runtime log if you can reach it. If nothing works, ask for a human-opened VitaShell FTP and do one transfer at a time. |
 | Vita hangs, crashes or reboots | Stop traffic, keep the dump, event and runtime evidence, and report it. No remote dumper exists. |
 
-## Replacing the trusted PC
+## Adding and switching PC identities
 
-The plugin stores one trusted PC certificate in `ur0:data/vita-agent-use/peer.der`. Different agent names can share that identity. A fresh identity can replace it using the normal pairing command and physical approval; no file copying or VitaShell trust reset is needed.
+The Vita retains every physically approved identity in `ur0:data/vita-agent-use/peers/`, keyed by the certificate's SHA-256 fingerprint. There is no fixed peer-count limit in RAM: lookup reads just that identity's file. The old `peer.der` is migrated automatically, preserving the existing pairing and ACL subject.
 
-1. Finish/cancel active runs, wait for any coredump to finalize, and stop the current PC server. Reconcile uncertain effects before replacement. Stopping `serve` does not necessarily end the Vita-side session. If pairing is refused and diagnostics reports `commands listening`, reboot the Vita with the old server stopped before attempting the new pairing. While the command session remains active, the pairing port is closed.
-2. Set `VITA_AGENT_CONFIG_DIR` to the absolute directory containing the new configuration, then run `./vita-agent session pair`. It creates the PC identity if needed.
-3. Check the fingerprint and tap OK on the Vita. For a different saved peer, the dialog explicitly says this replaces the previously paired computer. Cancel or timeout keeps the old peer.
-4. Start `serve` using the same config. Its `device_dir` is ordinary private PC storage; no particular directory name or pre-existing test files are required.
+1. Finish the current controller's work, wait for dumps to finalize, and stop its `serve` process gracefully. One controller owns the command connection at a time; approving many identities does not allow competing input streams.
+2. Select the new identity's config using `VITA_AGENT_CONFIG_DIR`, then run `session pair`. Bootstrap/provision creates its private PC files if needed.
+3. Compare the fingerprint and tap OK once. Cancel, timeout or a failed write never replaces or deletes another identity's trust.
+4. Start `serve`. For later visits, select this config and use `session connect` or `serve`; repeating `session pair` for an approved identity also reconnects without prompting again.
 
-The Vita retains the previous peer while installing the approved replacement and restores it on startup if replacement was interrupted before installation. Unreadable saved trust is reported as a recovery error, not silently reset.
+The admission port stays listening while commands are served. Requests wait for the active connection and native content/install work to finish; after stopping the old server, they proceed without rebooting or waiting an hour for expiry. A timeout can mean another server still owns the connection; it is not evidence that pairing files must be deleted. An unknown identity using `session connect` receives `identity_not_paired` and instructions to pair once.
 
-The original PC will no longer authenticate after replacement. The Vita certificate stays the same. Existing ACL entries remain tied to their original PC certificate; they do not grant the new identity access. A preserved old peer/identity may regain its old ACLs if deliberately paired again.
+Each approval is saved through a synced temporary file and rename, then read back before the token reply. A partial `.tmp` is never trusted. Previously approved PCs retain their ACLs; new identities must separately request protected-path access. Keep each config's `pc/` files together; changing directories does not transfer an identity.
 
 ## Safe diagnostics
 

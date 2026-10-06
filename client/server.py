@@ -347,7 +347,7 @@ class RunCoordinator:
                 if begun:
                     try:checked(c.call('run.end',{'run_id':run['run_id'],'phase':phase}))
                     except Exception as exc:cleanup.append(str(exc))
-                if self.server.screen_off_when_done:
+                if self.server.screen_off_when_done and not self.server.background_screen_busy():
                     try:screen_off_if_idle(c)
                     except Exception as exc:cleanup.append(str(exc))
             if not self.server.connected and phase=='completed':phase='connection_lost';error='Connection lost during cleanup; final state is uncertain.'
@@ -363,6 +363,7 @@ class AgentServer:
         self.options=options;self.root=options.state.parent/'server';self.root.mkdir(mode=0o700,parents=True,exist_ok=True)
         self.store=EventStore(self.root);self.screen_off_when_done=options.screen_off_when_done
         self.connected=False;self.logs={};self.closing=threading.Event();self.rpc_guard=threading.RLock();self.control_queue=queue.Queue(maxsize=8);self.connection_error=None;self.reconnect_disabled=False;self.native_seen=set();self.native_order=[];self.dropped_counts={}
+        self.saving_dumps=set()
         self.client=client or ServerClient(private_json(options.credentials),options.state,timeout=20,retry_disconnect=False,manage_screen=False,screen_off_when_done=False,host=options.vita_ip,agent_name=options.agent_name,event_sink=self.receive,disconnect_sink=self.disconnected)
         seen_path=self.root/'native-events.json'
         if seen_path.exists():
@@ -370,7 +371,14 @@ class AgentServer:
         self.last_activity=time.monotonic()
         self.runs=RunCoordinator(self)
     def event(self,event):
+        path=event.get('path','')
+        if event.get('type')=='coredump.saving':
+            self.saving_dumps.add(path.removesuffix('.tmp'))
+        elif event.get('type')=='coredump.complete':
+            self.saving_dumps.discard(path)
         result=self.store.append(event);self.runs.on_event(result);return result
+    def background_screen_busy(self):
+        return bool(self.logs or self.saving_dumps)
     def receive(self,frame):
         self.last_activity=time.monotonic()
         kind,result=frame['type'],frame['result'];run=frame.get('run_id')
@@ -539,7 +547,7 @@ class AgentServer:
                     failed=sys.exc_info()[0] is not None
                     # Preserve the primary failure and any pending request;
                     # local validation errors still get normal screen cleanup.
-                    cleanup=self.screen_off_when_done and not self.runs.busy() and getattr(options,'op',None)!='system.reboot' and not (options.group=='screen' and options.action in ('on','off'))
+                    cleanup=self.screen_off_when_done and not self.runs.busy() and not self.background_screen_busy() and getattr(options,'op',None)!='system.reboot' and not (options.group=='screen' and options.action in ('on','off'))
                     if cleanup and (not failed or (self.connected and self._pending() is None)):
                         try:
                             screen_off_if_idle(self.client);self.last_activity=time.monotonic()

@@ -11,7 +11,7 @@ import threading
 import time
 import uuid
 
-from vita_client import ClientError, NativeFrameError, UploadError, VitaClient, private_json, strict_json, validate_host, validate_agent_name
+from vita_client import ClientError, NativeFrameError, UploadError, VitaClient, private_json, strict_json, validate_host, validate_agent_name, connection_refused_message
 
 CONFIG_ENV = "VITA_AGENT_CONFIG_DIR"
 
@@ -352,6 +352,7 @@ def main(argv=None):
             if not a.device_dir:p.error('session setup requires device_dir in config.json')
             import pair_vita
             pair_vita.BASE=a.device_dir.resolve()
+            reused=False
             with contextlib.redirect_stdout(sys.stderr):
                 if a.action=='provision':
                     host=a.host or a.vita_ip
@@ -362,9 +363,23 @@ def main(argv=None):
                         host=a.vita_ip
                         if not host:raise ClientError('Set vita_ip in the selected config.')
                         pair_vita.provision(host,a.agent_name or 'Agent')
-                    creds=pair_vita.pair(resume=a.action=='connect',**connection_options(a))
-                    client=pair_vita.wait_for_commands(creds,screen_off_when_done=a.screen_off_when_done)
-            emit({'status':'ok'});return 0
+                    try:
+                        creds=pair_vita.pair(resume=a.action=='connect',**connection_options(a))
+                    except ConnectionRefusedError:
+                        if a.action!='connect' or not a.credentials.exists():
+                            raise
+                        # A stopped serve can leave its token and command listener
+                        # alive while the fresh-session port is closed. Reuse the
+                        # exact credentials/state; never mint IDs past a pending effect.
+                        client=VitaClient(private_json(a.credentials),a.state,timeout=20,
+                                          screen_off_when_done=a.screen_off_when_done,**connection_options(a))
+                        reply=client.call('capabilities')
+                        if reply.get('status')!='ok':
+                            raise ClientError('Saved command session was rejected; start serve or wait for the session to expire.')
+                        reused=True
+                    if not reused:
+                        client=pair_vita.wait_for_commands(creds,screen_off_when_done=a.screen_off_when_done)
+            emit({'status':'ok','result':{'session':'reused'}} if reused else {'status':'ok'});return 0
         if not a.state:raise ClientError('Set device_dir or state in the selected config.')
         if a.group=='macro' and a.action in ('save','load','compile'):
             from macros import MacroStore,compile_macro
@@ -420,6 +435,8 @@ def main(argv=None):
         emit(e.as_result());return 1
     except NativeFrameError as e:
         emit(e.as_result());return 1
+    except ConnectionRefusedError:
+        emit({'status':'client_error','message':connection_refused_message()});return 1
     except (ClientError,OSError,ValueError,TypeError) as e:
         emit({'status':'client_error','message':str(e)});return 1
     finally:

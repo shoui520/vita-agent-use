@@ -38,6 +38,7 @@ int vau_perf_start(struct vau_perf_watch *, uint64_t owner, uint32_t interval_ms
 int vau_perf_tick(struct vau_perf_watch *, const struct vau_perf_observation *);
 int vau_perf_json(const struct vau_perf_watch *, uint64_t owner, uint32_t after, char *, size_t);
 void vau_performance_stop(void);
+int vau_vita_performance_busy(void);
 int vau_vita_performance(void *, uint64_t owner, unsigned op, uint32_t value, uint32_t after,
                          char *, size_t);
 

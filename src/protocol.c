@@ -1379,12 +1379,15 @@ static int request_locked(struct vau_session *s, const struct vau_native_api *ap
 
 	if (api->content_busy && api->content_busy(api->context) &&
 	    (command->operation == OP_LAUNCH || command->operation == OP_CLOSE ||
-	     command->operation == OP_REBOOT ||
+	     command->operation == OP_REBOOT || command->operation == OP_SCREEN_OFF ||
 	     (command->operation >= OP_FILE_MKDIR && command->operation <= OP_FILE_PURGE))) {
 		return error_reply(response, capacity, id, VAU_BUSY);
 	}
 
 	unsigned char digest[32];
+
+	if (command->operation == OP_SCREEN_OFF && s->run_id[0])
+		return error_reply(response, capacity, id, VAU_BUSY);
 
 	/* Exactly once per session: the same id with the same command replays the
 	 * stored reply without executing again; anything else under it is STALE. */
