@@ -12,6 +12,7 @@
 #include "diagnostics_vita.h"
 #include "writes_vita.h"
 #include "package_install.h"
+#include "decrypt.h"
 #include "peer_store.h"
 #include "acl_vita.h"
 #include "content_runtime.h"
@@ -725,7 +726,7 @@ static int runtime_thread(SceSize args, void *argp)
 				 * until the current command connection and native work release it.
 				 * This reuses the existing TLS arena and preserves live operations. */
 				if (!network.commands.connected && !vau_vita_install_busy() &&
-				    !vau_vita_content_inflight()) {
+				    !vau_vita_decrypt_busy() && !vau_vita_content_inflight()) {
 					int waiting = vau_net_wait(&waiter, &listener, 0, 0);
 
 					if (waiting < 0)

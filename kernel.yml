@@ -28,3 +28,4 @@ vita_agent_kernel:
         - vauPerformanceRead
         - vauDumpEvents
         - vauTtyRead
+        - vauDecryptSelf

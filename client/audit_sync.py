@@ -70,7 +70,7 @@ def validate_page(page, after):
                 raise ClientError('Invalid audit flag.')
         if type(event['phase']) is not int or not 0 <= event['phase'] <= 3:
             raise ClientError('Invalid audit phase.')
-        if type(event['operation']) is not int or not 0 <= event['operation'] <= 7:
+        if type(event['operation']) is not int or not 0 <= event['operation'] <= 8:
             raise ClientError('Invalid audit operation.')
         if type(event['result']) is not int or not -2**31 <= event['result'] <= 0:
             raise ClientError('Invalid audit result.')

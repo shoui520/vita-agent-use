@@ -15,6 +15,8 @@ Conventions: `ID` is 32 lowercase hex characters. Title IDs are 9 uppercase alph
 | `screen.off` | `{}`. The server's automatic screen cleanup does not account for a generic call the way it does for typed screen commands. |
 | `app.launch` / `app.close` | `{title_id}`. Launch uses the host's close-and-confirm wrapper. |
 | `app.list` | Optional `after` and `query` for one raw batch. Without a cursor, the host returns the complete list with query/limit/page. |
+| `decrypt.start` | `{operation_id, path}`. Stable 32-character lower-case hex ID and normalized source SELF path. Starts or returns the same peer-owned job. Prefer typed `decrypt` for verified host download. |
+| `decrypt.status` | `{operation_id}`. Returns running/complete/failed/uncertain, native phase/result, output path, bytes and SHA-256. |
 | `app.install` | `{operation_id:ID, path, yes:true}`. Starts the install without waiting. |
 | `app.install.status` | `{operation_id:ID}` |
 | `input.acquire`, `input.heartbeat`, `input.status`, `input.cancel`, `input.release` | `{}`. Ordinary input is not bound to a title; the lease lasts 5 s. |

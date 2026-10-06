@@ -49,6 +49,13 @@ def parser():
     c.add_argument('--no-wait', action='store_true', help='Return the operation ID while installation continues.')
     c.add_argument('--timeout', type=float, default=1800, help='Seconds to wait; does not cancel native promotion.')
     cmd(g, 'install-status', 'app.install.status').add_argument('operation_id')
+    c = groups.add_parser('decrypt', help='Decrypt a Vita SELF to a host ELF using native authentication/PFS.')
+    c.set_defaults(action='decrypt', op=None)
+    c.add_argument('path', help='Vita filesystem path to eboot.bin, .self, .suprx or .skprx.')
+    c.add_argument('--output', type=Path, help='New host ELF file; defaults to the source basename with .elf extension.')
+    c.add_argument('--operation-id', help='Reuse this ID to inspect/resume the same native job.')
+    c.add_argument('--timeout', type=float, default=1800)
+    c.add_argument('--no-wait', action='store_true', help='Return the job ID; query using call decrypt.status.')
     g = group('screen', 'Display control and JPEG capture.')
     cmd(g, 'on', 'screen.on'); cmd(g, 'off', 'screen.off')
     cmd(g, 'capture').add_argument('--output', type=Path, required=True)
@@ -177,6 +184,9 @@ def wait_runner(runner):
 
 
 def execute(a,c,emit_result=emit):
+    if a.group=='decrypt':
+        from decrypt import decrypt
+        return decrypt(c,a.path,a.output,a.operation_id,a.timeout,a.no_wait,emit_result)
     if a.op=='app.install':
         import math
         if not math.isfinite(a.timeout) or a.timeout<=0:raise ClientError('Install timeout must be positive and finite.')

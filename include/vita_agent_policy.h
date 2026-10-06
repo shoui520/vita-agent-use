@@ -18,7 +18,8 @@ enum vau_file_operation {
 	VAU_FS_RENAME_SOURCE,
 	VAU_FS_RENAME_DESTINATION,
 	VAU_FS_PURGE,
-	VAU_FS_INSTALL /* Audit-only native operation; ordinary write ACLs do not authorize it. */
+	VAU_FS_INSTALL, /* Audit-only native operation; ordinary write ACLs do not authorize it. */
+	VAU_FS_DECRYPT  /* Audit-only SELF export; source is checked as READ, output as WRITE. */
 };
 
 enum vau_policy_decision {

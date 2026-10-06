@@ -116,7 +116,7 @@ static int decode(sqlite3_stmt *s, struct vau_write_record *r)
 	STR(1, r->request.subject);
 	STR(2, r->request.id);
 	NUM(3, VAU_WRITE_PREPARE, r->phase);
-	NUM(4, VAU_FS_INSTALL, r->request.operation);
+	NUM(4, VAU_FS_DECRYPT, r->request.operation);
 	STR(5, r->request.path);
 	STR(6, r->request.destination);
 	NUM(7, 1, r->request.yes);
@@ -494,7 +494,7 @@ static int request_valid(const struct vau_write_request *r)
 	                                  : !!*r->trash_id) ||
 	    vau_path_normalize(r->path, path, sizeof(path)) || strcmp(path, r->path) ||
 	    r->operation == VAU_FS_READ || r->operation == VAU_FS_RENAME_DESTINATION ||
-	    (unsigned)r->operation > VAU_FS_INSTALL || r->yes > 1 || r->recursive > 1 ||
+	    (unsigned)r->operation > VAU_FS_DECRYPT || r->yes > 1 || r->recursive > 1 ||
 	    r->overwrite > 1 || r->bytes > INT64_MAX) {
 		return 0;
 	}
@@ -505,6 +505,10 @@ static int request_valid(const struct vau_write_request *r)
 	} else if (*r->destination) {
 		return 0;
 	}
+
+	if (r->operation == VAU_FS_DECRYPT)
+		return !r->recursive && !r->overwrite && !*r->expected_sha256 &&
+		       (!*r->sha256 || hex(r->sha256, 64));
 
 	if (r->operation == VAU_FS_INSTALL) {
 		size_t length = strlen(r->path);
@@ -560,6 +564,14 @@ int vau_journal_append(void *context, struct vau_write_record *r)
 	if (rc == 1) {
 		rc = (r->phase == VAU_WRITE_INTENT || r->phase == VAU_WRITE_PREPARE) ? VAU_OK : VAU_STALE;
 	} else if (!rc) {
+		/* A native SELF export computes its output digest after decryption.
+		 * Only this audit-only operation can fill an empty digest at completion;
+		 * uploads still bind the client's immutable digest before any write. */
+		if (existing.request.operation == VAU_FS_DECRYPT &&
+		    r->request.operation == VAU_FS_DECRYPT && existing.phase == VAU_WRITE_INTENT &&
+		    r->phase == VAU_WRITE_COMPLETE && !existing.request.sha256[0])
+			strcpy(existing.request.sha256, r->request.sha256);
+
 		if (!vau_write_request_same(&existing.request, &r->request) ||
 		    existing.phase == VAU_WRITE_COMPLETE || r->phase == VAU_WRITE_PREPARE ||
 		    (r->phase == VAU_WRITE_INTENT && existing.phase != VAU_WRITE_PREPARE) ||

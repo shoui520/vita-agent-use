@@ -14,6 +14,7 @@
 #include "acl_vita.h"
 #include "content_runtime.h"
 #include "package_install.h"
+#include "decrypt.h"
 #include <psp2/appmgr.h>
 #include <psp2/power.h>
 #include <psp2/io/devctl.h>
@@ -44,7 +45,7 @@ static uint64_t clock_us(void *ctx)
 static int content_busy(void *ctx)
 {
 	(void)ctx;
-	return vau_vita_content_busy() || vau_vita_install_busy();
+	return vau_vita_content_busy() || vau_vita_install_busy() || vau_vita_decrypt_busy();
 }
 
 static int launch(void *ctx, const char *uri)
@@ -248,19 +249,30 @@ static void approval_poll(void *ctx)
 	}
 
 	vau_vita_install_poll();
+	vau_vita_decrypt_poll();
 	vau_vita_approval_poll(ctx);
+}
+
+static int install_guarded(void *ctx, uint64_t owner, const char *subject, const char *id,
+                           const char *path, int start, char *out, size_t cap)
+{
+	if (start && vau_vita_decrypt_busy())
+		return VAU_BUSY;
+	return vau_vita_install(ctx, owner, subject, id, path, start, out, cap);
 }
 
 static int install_guarded_upload(void *ctx, const struct vau_upload_message *m,
                                   struct vau_upload_status *s, struct vau_write_record *r)
 {
-	return vau_vita_install_busy() ? VAU_BUSY : vau_vita_file_upload(ctx, m, s, r);
+	return (vau_vita_install_busy() || vau_vita_decrypt_busy())
+	               ? VAU_BUSY
+	               : vau_vita_file_upload(ctx, m, s, r);
 }
 
 static int install_guarded_content(void *ctx, uint64_t owner, const char *subject,
                                    const struct vau_content_query *q, char *out, size_t cap)
 {
-	if (vau_vita_install_busy() &&
+	if ((vau_vita_install_busy() || vau_vita_decrypt_busy()) &&
 	    (q->operation == VAU_CONTENT_PREVIEW || q->operation == VAU_CONTENT_REQUEST)) {
 		return VAU_BUSY;
 	}
@@ -303,7 +315,8 @@ const struct vau_native_api vau_vita_native_api = { .clock               = clock
 	                                                .dialog_events     = vau_vita_dialog_events,
 	                                                .app_list          = vau_vita_app_list,
 	                                                .app_running       = vau_vita_app_running,
-	                                                .app_install       = vau_vita_install,
+	                                                .app_install       = install_guarded,
+	                                                .decrypt           = vau_vita_decrypt,
 	                                                .file_stat         = vau_vita_file_stat,
 	                                                .file_list         = vau_vita_file_list,
 	                                                .file_read         = vau_vita_file_read,

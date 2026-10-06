@@ -248,7 +248,7 @@ class VitaClient:
 
     @staticmethod
     def _command(op, args):
-        if op not in ('events.subscribe', 'run.begin', 'run.update', 'run.end', 'run.status', 'capabilities', 'system.snapshot', 'app.launch', 'app.close', 'app.install', 'app.install.status', 'screen.on', 'screen.off', 'system.reboot',
+        if op not in ('events.subscribe', 'run.begin', 'run.update', 'run.end', 'run.status', 'capabilities', 'system.snapshot', 'app.launch', 'app.close', 'app.install', 'app.install.status', 'decrypt.start', 'decrypt.status', 'screen.on', 'screen.off', 'system.reboot',
                       'input.acquire', 'input.heartbeat', 'input.cancel', 'input.release', 'input.status', 'input.submit', 'fs.stat', 'fs.list', 'touch.panels', 'app.list', 'fs.mkdir', 'fs.move', 'fs.trash', 'fs.purge', 'acl.request', 'acl.status', 'acl.audit', 'macro.acquire', 'plugins.list', 'performance.measure', 'performance.watch', 'performance.read', 'performance.cancel', 'app.running', 'events.start', 'events.read', 'events.stop', 'livearea.schema', 'log.start', 'log.read', 'log.stop', 'content.list', 'livearea.layout', 'livearea.blob', 'dialog.events.start', 'dialog.events.read', 'dialog.events.stop', 'macro.enqueue', 'content.delete.status', 'content.delete.changes', 'content.audit', 'content.delete.preview', 'content.scope', 'content.delete.request', 'content.albums'):
             raise ClientError('Unsupported operation.')
         if not isinstance(args, dict):
@@ -426,6 +426,14 @@ class VitaClient:
                 raise ClientError('Invalid application inventory cursor.')
             if not isinstance(query, str) or '\x00' in query or any(0xd800 <= ord(c) <= 0xdfff for c in query) or len(query.encode('utf-8')) >= 128:
                 raise ClientError('Application query must be fewer than128 UTF-8 bytes.')
+        elif op in ('decrypt.start', 'decrypt.status'):
+            expected={'operation_id','path'} if op=='decrypt.start' else {'operation_id'}
+            if set(args)!=expected or not isinstance(args['operation_id'],str) or not re.fullmatch('[0-9a-f]{32}',args['operation_id']):
+                raise ClientError('Decryption requires a stable 32-digit operation_id.')
+            if op=='decrypt.start':
+                VitaClient._command('fs.stat',{'path':args['path']})
+                if any(part in ('','.','..') for part in args['path'].split(':',1)[1].split('/')):
+                    raise ClientError('Decryption requires a normalized Vita file path.')
         elif op in ('app.install', 'app.install.status'):
             expected={'operation_id','path','yes'} if op=='app.install' else {'operation_id'}
             if set(args)!=expected or not isinstance(args['operation_id'],str) or not re.fullmatch('[0-9a-f]{32}',args['operation_id']):
@@ -807,11 +815,11 @@ class VitaClient:
                 self._close_transport()
                 raise
 
-    def download(self, path, output):
+    def download(self, path, output, progress=None):
         """Stream to a new private host file; remove incomplete output on failure."""
         self._command('fs.stat', {'path': path})
         fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        offset, revision = 0, None
+        offset, revision, reported = 0, None, 0.0
         try:
             with os.fdopen(fd, 'wb') as stream:
                 while True:
@@ -822,6 +830,9 @@ class VitaClient:
                     revision = current
                     stream.write(data)
                     offset += len(data)
+                    if progress is not None and (time.monotonic()-reported>=1 or offset==metadata['file_bytes']):
+                        progress({'status':'progress','result':{'phase':'download','received':str(offset),'bytes':str(metadata['file_bytes'])}})
+                        reported=time.monotonic()
                     if offset == metadata['file_bytes']:
                         break
                 stream.flush()

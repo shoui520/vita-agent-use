@@ -147,6 +147,7 @@ struct vau_native_api {
 	int (*app_running)(void *context, char *out, size_t capacity);
 	int (*app_install)(void *, uint64_t, const char *, const char *, const char *, int, char *,
 	                   size_t);
+	int (*decrypt)(void *, uint64_t, const char *, const char *, const char *, int, char *, size_t);
 	int (*plugin_list)(void *context, uint32_t offset, char *out, size_t capacity);
 	int (*app_list)(void *context, const char *after, const char *query, struct vau_app_page *out);
 

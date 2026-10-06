@@ -11,6 +11,7 @@ Before changing behavior, read both the host wrapper and the native code path. K
 | Apps, launch, install | `client/launch.py`; `src/app_registry.c`, `native_vita.c`, `package_install.c` |
 | Metadata, plugins | `client/system_metadata.py`; `src/system_vita.c`, `metadata_vita.c`, `plugins_vita.c`, `modules_kernel.c` |
 | Input, macros, touch, emergency stop | `client/input_sequence.py`, `macros.py`, `macro_runner.py`, `swipes.py`; `include/vita_agent.h`; `src/timeline.c`, `input_sequence.c`, `input_owner.c`, `kernel.c`, `touch_kernel.c`, `stop_monitor.c` |
+| Native SELF decryption | `client/decrypt.py`; `src/decrypt.c`, `decrypt_vita.c`, `decrypt_kernel.c`; `include/vau_decrypt.h` |
 | Frames, display | `src/frames_shell.c`, `shell_jpeg.c`, `capture_kernel.c`, `system_vita.c`; entry points in `vita_client.py` and `vita_agent.py` |
 | Performance | `client/performance.py`; `src/performance.c`, `performance_vita.c`, `performance_kernel.c`; `include/vau_performance.h` |
 | Filesystem, transfers, policy, audit | `client/upload.py`, `audit_sync.py`; `src/files_vita.c`, `file_ops.c`, `policy.c`, `write_ops.c`, `write_journal.c`, `staged_upload.c`, `upload_commit.c`, `file_mutations.c`, `trash_purge.c` |

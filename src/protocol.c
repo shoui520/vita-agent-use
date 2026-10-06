@@ -78,7 +78,9 @@ enum {
 	OP_RUN_BEGIN,
 	OP_RUN_UPDATE,
 	OP_RUN_END,
-	OP_RUN_STATUS
+	OP_RUN_STATUS,
+	OP_DECRYPT,
+	OP_DECRYPT_STATUS
 };
 
 static const char *const operations[] = {
@@ -141,6 +143,8 @@ static const char *const operations[] = {
 	"run.update",
 	"run.end",
 	"run.status",
+	"decrypt.start",
+	"decrypt.status",
 };
 
 void vau_session_init(struct vau_session *s, unsigned rights)
@@ -458,7 +462,8 @@ static int parse(const char *json, size_t length, struct vau_command *out, struc
 		return found == 3 ? VAU_OK : VAU_INVALID;
 	}
 
-	if (out->operation == OP_INSTALL || out->operation == OP_INSTALL_STATUS) {
+	if (out->operation == OP_INSTALL || out->operation == OP_INSTALL_STATUS ||
+	    out->operation == OP_DECRYPT || out->operation == OP_DECRYPT_STATUS) {
 		unsigned found = 0;
 
 		for (size_t i = args + 1; i < t[args].next; i = t[i + 1].next) {
@@ -477,7 +482,8 @@ static int parse(const char *json, size_t length, struct vau_command *out, struc
 				for (unsigned j = 0; j < 32; j++)
 					if (!strchr("0123456789abcdef", out->mutation_id[j]))
 						return VAU_INVALID;
-			} else if (!strcmp(key, "path") && out->operation == OP_INSTALL) {
+			} else if (!strcmp(key, "path") &&
+			           (out->operation == OP_INSTALL || out->operation == OP_DECRYPT)) {
 				bit = 2;
 				if (vau_json_utf8(json, &t[i + 1], out->path, sizeof(out->path)) || !out->path[0])
 					return VAU_INVALID;
@@ -485,7 +491,8 @@ static int parse(const char *json, size_t length, struct vau_command *out, struc
 				char normalized[VAU_PATH_MAX];
 				size_t n = strlen(out->path);
 
-				if (n < 5 || strcmp(out->path + n - 4, ".vpk") ||
+				if ((out->operation == OP_INSTALL &&
+				     (n < 5 || strcmp(out->path + n - 4, ".vpk"))) ||
 				    vau_path_normalize(out->path, normalized, sizeof(normalized)) ||
 				    strcmp(normalized, out->path)) {
 					return VAU_INVALID;
@@ -506,7 +513,11 @@ static int parse(const char *json, size_t length, struct vau_command *out, struc
 			found |= bit;
 		}
 
-		return found == (out->operation == OP_INSTALL ? 7u : 1u) ? VAU_OK : VAU_INVALID;
+		return found == (out->operation == OP_INSTALL   ? 7u
+		                 : out->operation == OP_DECRYPT ? 3u
+		                                                : 1u)
+		               ? VAU_OK
+		               : VAU_INVALID;
 	}
 
 	if (out->operation >= OP_CONTENT_STATUS && out->operation <= OP_CONTENT_ALBUMS) {
@@ -1359,8 +1370,9 @@ static int request_locked(struct vau_session *s, const struct vau_native_api *ap
 	                         : VAU_RIGHT_CONTROL;
 
 	if ((command->operation >= OP_RUN_BEGIN && command->operation <= OP_RUN_END) ||
-	    command->operation == OP_INSTALL || command->operation == OP_MACRO_ENQUEUE ||
-	    command->operation == OP_CONTENT_PREVIEW || command->operation == OP_CONTENT_REQUEST) {
+	    command->operation == OP_INSTALL || command->operation == OP_DECRYPT ||
+	    command->operation == OP_MACRO_ENQUEUE || command->operation == OP_CONTENT_PREVIEW ||
+	    command->operation == OP_CONTENT_REQUEST) {
 		right = VAU_RIGHT_CONTROL;
 	}
 
@@ -1371,9 +1383,9 @@ static int request_locked(struct vau_session *s, const struct vau_native_api *ap
 	 * new input was accepted while the user is deciding. */
 	if (api->approval_pending && api->approval_pending(api->context) &&
 	    ((command->operation >= OP_LAUNCH && command->operation <= OP_INPUT_RELEASE) ||
-	     command->operation == OP_INSTALL || command->operation == OP_INPUT_SUBMIT ||
-	     command->operation == OP_MACRO_ENQUEUE || command->operation == OP_REBOOT ||
-	     command->operation == OP_MACRO_ACQUIRE)) {
+	     command->operation == OP_INSTALL || command->operation == OP_DECRYPT ||
+	     command->operation == OP_INPUT_SUBMIT || command->operation == OP_MACRO_ENQUEUE ||
+	     command->operation == OP_REBOOT || command->operation == OP_MACRO_ACQUIRE)) {
 		return error_reply(response, capacity, id, VAU_BUSY);
 	}
 
@@ -1386,7 +1398,7 @@ static int request_locked(struct vau_session *s, const struct vau_native_api *ap
 
 	unsigned char digest[32];
 
-	if (command->operation == OP_SCREEN_OFF && s->run_id[0])
+	if ((command->operation == OP_SCREEN_OFF || command->operation == OP_DECRYPT) && s->run_id[0])
 		return error_reply(response, capacity, id, VAU_BUSY);
 
 	/* Exactly once per session: the same id with the same command replays the
@@ -1415,13 +1427,18 @@ static int request_locked(struct vau_session *s, const struct vau_native_api *ap
 	int n = error_reply(s->reply, sizeof(s->reply), id, VAU_DEVICE_ERROR);
 
 	s->reply_length = (size_t)n;
-	if (command->operation == OP_INSTALL || command->operation == OP_INSTALL_STATUS) {
+	if (command->operation == OP_INSTALL || command->operation == OP_INSTALL_STATUS ||
+	    command->operation == OP_DECRYPT || command->operation == OP_DECRYPT_STATUS) {
 		char result[2048];
-		int result_bytes = api->app_install ? api->app_install(api->context, s->handle, s->subject,
-		                                                       command->mutation_id, command->path,
-		                                                       command->operation == OP_INSTALL,
-		                                                       result, sizeof(result))
-		                                    : VAU_UNSUPPORTED;
+		int decrypt = command->operation == OP_DECRYPT || command->operation == OP_DECRYPT_STATUS;
+		int (*execute)(void *, uint64_t, const char *, const char *, const char *, int, char *,
+		               size_t) = decrypt ? api->decrypt : api->app_install;
+		int result_bytes       = execute ? execute(api->context, s->handle, s->subject,
+		                                           command->mutation_id, command->path,
+		                                           command->operation == OP_INSTALL ||
+		                                                   command->operation == OP_DECRYPT,
+		                                           result, sizeof(result))
+		                                 : VAU_UNSUPPORTED;
 
 		if (result_bytes < 0) {
 			n = error_reply(response, capacity, id, result_bytes);
@@ -1444,7 +1461,7 @@ static int request_locked(struct vau_session *s, const struct vau_native_api *ap
 		n = vau_snprintf(
 		        response, capacity,
 		        "{\"v\":1,\"id\":%s,\"status\":\"ok\",\"result\":{"
-		        "\"operations\":[\"capabilities\",\"system.snapshot\",\"app.launch\",\"app.close\",\"screen.on\",\"screen.off\",\"input.acquire\",\"input.heartbeat\",\"input.cancel\",\"input.release\",\"input.status\",\"input.submit\",\"fs.stat\",\"fs.list\",\"touch.panels\",\"system.reboot\",\"app.list\",\"fs.mkdir\",\"fs.move\",\"fs.trash\",\"fs.purge\",\"acl.request\",\"acl.status\",\"acl.audit\",\"macro.acquire\",\"plugins.list\",\"app.running\",\"performance.measure\",\"performance.watch\",\"performance.read\",\"performance.cancel\",\"events.start\",\"events.read\",\"events.stop\",\"livearea.schema\",\"log.start\",\"log.read\",\"log.stop\",\"content.list\",\"livearea.layout\",\"livearea.blob\",\"dialog.events.start\",\"dialog.events.read\",\"dialog.events.stop\",\"macro.enqueue\",\"content.delete.status\",\"content.delete.changes\",\"content.audit\",\"content.delete.preview\",\"content.scope\",\"content.delete.request\",\"content.albums\",\"app.install\",\"app.install.status\",\"events.subscribe\",\"run.begin\",\"run.update\",\"run.end\",\"run.status\"],"
+		        "\"operations\":[\"capabilities\",\"system.snapshot\",\"app.launch\",\"app.close\",\"screen.on\",\"screen.off\",\"input.acquire\",\"input.heartbeat\",\"input.cancel\",\"input.release\",\"input.status\",\"input.submit\",\"fs.stat\",\"fs.list\",\"touch.panels\",\"system.reboot\",\"app.list\",\"fs.mkdir\",\"fs.move\",\"fs.trash\",\"fs.purge\",\"acl.request\",\"acl.status\",\"acl.audit\",\"macro.acquire\",\"plugins.list\",\"app.running\",\"performance.measure\",\"performance.watch\",\"performance.read\",\"performance.cancel\",\"events.start\",\"events.read\",\"events.stop\",\"livearea.schema\",\"log.start\",\"log.read\",\"log.stop\",\"content.list\",\"livearea.layout\",\"livearea.blob\",\"dialog.events.start\",\"dialog.events.read\",\"dialog.events.stop\",\"macro.enqueue\",\"content.delete.status\",\"content.delete.changes\",\"content.audit\",\"content.delete.preview\",\"content.scope\",\"content.delete.request\",\"content.albums\",\"app.install\",\"app.install.status\",\"events.subscribe\",\"run.begin\",\"run.update\",\"run.end\",\"run.status\",\"decrypt.start\",\"decrypt.status\"],"
 		        "\"request_bytes_max\":131072,\"response_bytes_max\":4096,"
 		        "\"content_delete\":{\"kinds\":[\"application\",\"vita_savedata\"],\"savedata_user_min\":0,\"savedata_user_max\":63,\"requires_preview\":true,\"requires_physical_ok\":true},"
 		        "\"id_order\":\"strictly_increasing_decimal_strings\",\"cached_replies\":1,"

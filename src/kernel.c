@@ -7,6 +7,7 @@
 #include "vau_modules.h"
 #include "vau_events.h"
 #include "vau_tty.h"
+#include "vau_decrypt.h"
 #include "vau_performance.h"
 #include "stop_monitor.h"
 #include "capture_kernel.h"
@@ -137,6 +138,21 @@ int vauTtyRead(uint32_t operation, uint32_t after, VauTtyPage *user_out)
 	rc = authorized() ? vau_tty_kernel(operation, after, &out) : VAU_DENIED;
 	if (rc >= 0)
 		rc = ksceKernelCopyToUser(user_out, &out, sizeof(out));
+	EXIT_SYSCALL(state);
+	return rc;
+}
+
+int vauDecryptSelf(const VauDecryptRequest *user_request, void *data)
+{
+	uint32_t state;
+	VauDecryptRequest request;
+	int rc;
+
+	ENTER_SYSCALL(state);
+	rc = authorized() ? ksceKernelCopyFromUser(&request, user_request, sizeof(request))
+	                  : VAU_DENIED;
+	if (rc >= 0)
+		rc = vau_decrypt_kernel(&request, data);
 	EXIT_SYSCALL(state);
 	return rc;
 }
