@@ -7,7 +7,7 @@ Before changing behavior, read both the host wrapper and the native code path. K
 | CLI, config, routing, output | `vita-agent` launcher; `client/vita_agent.py`, `client/config.example.json` |
 | Bootstrap, PC identity, pairing | `client/bootstrap.py`, `client/pair_vita.py`; `src/pairing_worker.c`, `pairing_activation.c`, `pairing_ui.c`, `pairing_tls.c` |
 | Transport, recovery, command schemas | `client/vita_client.py`; `src/protocol.c`, `protocol.h`, `service.c`, `tls_server.c` |
-| Server, events, runs | `client/server.py`, `client/event_listener.py`; `src/shell_runtime.c`, `events_vita.c`, `events_kernel.c`, `dialog_events.c`, `log_watch_vita.c`, `log_marker.c` |
+| Server, events, runs | `client/server.py`, `client/event_listener.py`; `src/shell_runtime.c`, `events_vita.c`, `events_kernel.c`, `tty_kernel.c`, `tty_ring.c`, `tty_vita.c`, `dialog_events.c`, `log_watch_vita.c`, `log_marker.c` |
 | Apps, launch, install | `client/launch.py`; `src/app_registry.c`, `native_vita.c`, `package_install.c` |
 | Metadata, plugins | `client/system_metadata.py`; `src/system_vita.c`, `metadata_vita.c`, `plugins_vita.c`, `modules_kernel.c` |
 | Input, macros, touch, emergency stop | `client/input_sequence.py`, `macros.py`, `macro_runner.py`, `swipes.py`; `include/vita_agent.h`; `src/timeline.c`, `input_sequence.c`, `input_owner.c`, `kernel.c`, `touch_kernel.c`, `stop_monitor.c` |

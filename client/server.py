@@ -382,7 +382,7 @@ class AgentServer:
     def receive(self,frame):
         self.last_activity=time.monotonic()
         kind,result=frame['type'],frame['result'];run=frame.get('run_id')
-        if kind in ('coredump.batch','dialog.batch'):
+        if kind in ('coredump.batch','dialog.batch','tty.batch'):
             dropped=result.get('dropped',0);previous=self.dropped_counts.get(kind,0);self.dropped_counts[kind]=dropped
             if result.get('lost') or dropped!=previous:self.event({'type':'events.overflow','source':kind,'run_id':run,'lost':result.get('lost',0),'dropped_since_last':max(0,dropped-previous)})
             for event in result['events']:
@@ -390,6 +390,9 @@ class AgentServer:
                 if signature in self.native_seen:continue
                 self.native_seen.add(signature);self.native_order.append(signature)
                 if len(self.native_order)>256:self.native_seen.remove(self.native_order.pop(0))
+                if kind=='tty.batch':
+                    # Keep original bytes; UTF-8 is only a human-readable preview.
+                    event={**event,'text':bytes.fromhex(event['data']).decode('utf-8',errors='replace')}
                 self.event({**event,'run_id':run,'native_sequence':event.get('sequence')})
                 durable_json(self.root/'native-events.json',self.native_order)
         elif kind=='performance.batch':
@@ -416,7 +419,7 @@ class AgentServer:
                 self.reconnect_disabled=True
                 raise ClientError('Installed plugin rejected native push subscription; install the matching build. '+str(reply.get('error')))
             checked(reply);self.connected=True;self.connection_error=None;self.last_activity=time.monotonic()
-            self.event({'type':'connection.ready','transport':'persistent_tls_push'})
+            self.event({'type':'connection.ready','transport':'persistent_tls_push','tty':reply.get('result',{}).get('tty')})
     def _pending(self):
         return private_json(self.options.state).get('pending') if self.options.state.exists() else None
 

@@ -27,3 +27,4 @@ vita_agent_kernel:
         - vauPluginState
         - vauPerformanceRead
         - vauDumpEvents
+        - vauTtyRead

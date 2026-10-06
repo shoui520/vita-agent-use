@@ -679,16 +679,17 @@ int vau_connection_push(struct vau_connection *c, struct vau_service *s,
 		return 0;
 
 	/*
-	 * One source per 100 ms tick, over a 12-tick (1.2 s) cycle:
+	 * One source per 100 ms tick, over a 14-tick (1.4 s) cycle:
 	 *
 	 *   even slots      coredump events   (every 200 ms, so crashes surface fast)
 	 *   1               dialog errors
 	 *   3               performance samples
 	 *   5, 7, 9, 11     log watch 0..3
+	 *   13              kernel/user TTY
 	 *
 	 * Sources with nothing new send nothing.
 	 */
-	unsigned slot = c->push_slot++ % 12;
+	unsigned slot = c->push_slot++ % 14;
 	char *body    = c->output + VAU_CONNECTION_HEADER_BYTES;
 	const char *kind;
 	int n = VAU_UNSUPPORTED;
@@ -732,6 +733,19 @@ int vau_connection_push(struct vau_connection *c, struct vau_service *s,
 		if (n >= 0) {
 			session->perf_after = push_counter(body, "\"next_after\":");
 			if (strstr(body, "\"samples\":[]"))
+				return 0;
+		}
+	} else if (slot == 13) {
+		kind = "tty.batch";
+		if (api->tty)
+			n = api->tty(api->context, 1, session->tty_after, body, VAU_FILE_READ_BYTES);
+		if (n >= 0) {
+			uint32_t dropped = push_counter(body, "\"dropped\":");
+			unsigned changed = dropped != session->tty_dropped;
+
+			session->tty_dropped = dropped;
+			session->tty_after   = push_counter(body, "\"next\":");
+			if (strstr(body, "\"events\":[]") && !push_counter(body, "\"lost\":") && !changed)
 				return 0;
 		}
 	} else {

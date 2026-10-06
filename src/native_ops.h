@@ -141,6 +141,7 @@ struct vau_native_api {
 	int (*livearea_schema)(void *, const char *, char *, size_t);
 	int (*log_watch)(void *, const char *, uint32_t, const char *, const char *, uint32_t, char *,
 	                 size_t);
+	int (*tty)(void *, uint32_t, uint32_t, char *, size_t);
 	int (*dialog_events)(void *, uint32_t, uint32_t, char *, size_t);
 	int (*events)(void *context, uint32_t operation, uint32_t after, char *out, size_t capacity);
 	int (*app_running)(void *context, char *out, size_t capacity);
@@ -238,6 +239,7 @@ int vau_livearea_layout(const char *, const char *, uint32_t, char *, size_t);
 int vau_vita_livearea_layout(void *, const char *, uint32_t, char *, size_t);
 int vau_livearea_schema(const char *, const char *, char *, size_t);
 int vau_vita_livearea_schema(void *, const char *, char *, size_t);
+int vau_vita_tty(void *, uint32_t, uint32_t, char *, size_t);
 int vau_vita_dialog_events(void *, uint32_t, uint32_t, char *, size_t);
 int vau_vita_events(void *context, uint32_t operation, uint32_t after, char *out, size_t capacity);
 int vau_vita_app_running(void *context, char *out, size_t capacity);

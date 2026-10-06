@@ -6,6 +6,7 @@
 #include "timeline.h"
 #include "vau_modules.h"
 #include "vau_events.h"
+#include "vau_tty.h"
 #include "vau_performance.h"
 #include "stop_monitor.h"
 #include "capture_kernel.h"
@@ -120,6 +121,20 @@ int vauDumpEvents(uint32_t operation, uint32_t after, VauDumpPage *user_out)
 
 	ENTER_SYSCALL(state);
 	rc = authorized() ? vau_dump_events_kernel(operation, after, &out) : VAU_DENIED;
+	if (rc >= 0)
+		rc = ksceKernelCopyToUser(user_out, &out, sizeof(out));
+	EXIT_SYSCALL(state);
+	return rc;
+}
+
+int vauTtyRead(uint32_t operation, uint32_t after, VauTtyPage *user_out)
+{
+	uint32_t state;
+	int rc;
+	VauTtyPage out = { 0 };
+
+	ENTER_SYSCALL(state);
+	rc = authorized() ? vau_tty_kernel(operation, after, &out) : VAU_DENIED;
 	if (rc >= 0)
 		rc = ksceKernelCopyToUser(user_out, &out, sizeof(out));
 	EXIT_SYSCALL(state);

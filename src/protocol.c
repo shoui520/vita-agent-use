@@ -1470,12 +1470,18 @@ static int request_locked(struct vau_session *s, const struct vau_native_api *ap
 		if (got < 0) {
 			n = error_reply(response, capacity, id, got);
 		} else {
+			int tty = api->tty ? api->tty(api->context, 0, 0, result, sizeof(result))
+			                   : VAU_UNSUPPORTED;
+
+			s->tty_after = s->tty_dropped = 0;
+			if (tty < 0)
+				vau_snprintf(result, sizeof(result), "{\"error\":%d}", tty);
 			s->push_enabled = 1;
 			s->dump_after = s->dialog_after = 0;
 			n                               = vau_snprintf(
                     response, capacity,
-                    "{\"v\":1,\"id\":%s,\"status\":\"ok\",\"result\":{\"transport\":\"persistent_tls_push\",\"coredumps\":true}}",
-                    id);
+                    "{\"v\":1,\"id\":%s,\"status\":\"ok\",\"result\":{\"transport\":\"persistent_tls_push\",\"coredumps\":true,\"tty\":%s}}",
+                    id, result);
 		}
 	} else if (command->operation >= OP_RUN_BEGIN && command->operation <= OP_RUN_STATUS) {
 		rc = VAU_OK;

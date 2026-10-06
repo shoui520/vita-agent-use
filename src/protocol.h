@@ -48,6 +48,7 @@ struct vau_session {
 	unsigned reboot_pending, reboot_reply;
 	unsigned push_enabled, perf_push;
 	uint64_t run_started_us;
+	uint32_t tty_after, tty_dropped;
 	uint32_t dump_after, dialog_after, perf_after, dump_dropped, dialog_dropped, log_ids[4];
 	char run_id[33], run_title[VAU_TITLE_BYTES], run_phase[24];
 	uint64_t last_id;

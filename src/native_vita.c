@@ -299,6 +299,7 @@ const struct vau_native_api vau_vita_native_api = { .clock               = clock
 	                                                .log_watch         = vau_vita_log_watch,
 	                                                .livearea_schema   = vau_vita_livearea_schema,
 	                                                .events            = vau_vita_events,
+	                                                .tty               = vau_vita_tty,
 	                                                .dialog_events     = vau_vita_dialog_events,
 	                                                .app_list          = vau_vita_app_list,
 	                                                .app_running       = vau_vita_app_running,

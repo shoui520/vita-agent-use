@@ -19,6 +19,7 @@ python3 client/vita_agent.py server performance-start --seconds 60 --interval-ms
 | `coredump.saving` | A new `.psp2dmp.tmp` appeared. Record it and wait. |
 | `coredump.complete` | Renamed to the final `.psp2dmp`. Match it to the saving event and keep the full path. |
 | `dialog.error` | Error callback. Keep the code/hex; it does not prove a dialog was shown. |
+| `tty.data` | Automatically captured kernel/user printf output, with `source`, `pid`, native timestamp, lossless hex `data` and a readable `text` preview. |
 | `log.data` | Hex-encoded appended bytes with watch ID, path and offset. Decode on the host and handle chunk boundaries. |
 | `log.marker` | The exact literal was reached, including across chunk boundaries. |
 | `log.reset` | The log was truncated or replaced; offsets start over. |
@@ -28,6 +29,12 @@ python3 client/vita_agent.py server performance-start --seconds 60 --interval-ms
 | `command.progress` | Progress from a blocking server command; check `result`. |
 
 Records add a PC `sequence` and UTC `received_at`. The native sequence and time are stored separately, and event shapes vary. The server keeps 4,096 events in memory; older ones are in the `journal` (`events.jsonl`). After a restart, numbering continues but old events are not reloaded into memory. The dump listener fires only for **new** dumps, and events can be lost during a disconnect or overflow, so never claim "no crashes" when no receiver was connected.
+
+Kernel and user TTY logging starts automatically with `serve`'s authenticated subscription; no log-file watch is needed for `sceClibPrintf`. Inspect `connection.ready.tty`: `kernel_error` and `user_error` must both be zero. Unsupported firmware or a failed hook is reported there while other event sources remain usable. The native dispatchers are verified for retail 3.65, using the callback ABI researched from [CatLog](https://github.com/isage/catlog) and [PrincessLog](https://github.com/TeamFAPS/PSVita-RE-tools/tree/master/PrincessLog).
+
+TTY records are fragments, not guaranteed full lines. The kernel keeps 32 records of up to 256 bytes (about 9 KiB); output is pushed in bounded batches without allocating, writing files or using networking inside the logging callbacks. Capture starts at subscription and remains enabled until reboot, retaining recent output during disconnects. It does not recover older boot output. Existing native debug handlers and crash-dump TTY storage are preserved. Ordinary `printf` is covered when it uses the native debug-output path; a file or custom renderer is not TTY output.
+
+Keep the hex `data` to preserve arbitrary bytes. `text` decodes each fragment as UTF-8 with replacement, so a multibyte character split across records can appear incorrectly in the preview; decode consecutive data fragments on the PC when exact text matters. Long kernel printf calls retain the first 1,023 bytes. TTY `events.overflow` reports `lost` records and `dropped_since_last` bytes omitted through truncation or lock contention. Heavy logging can overflow the ring; capture never blocks the producer waiting for the PC. TTY receipt does not wake the screen or mark the agent as active.
 
 Log watches match an exact UTF-8 literal of 1–128 bytes (no regex) and start at the end of the file. They ignore older matches and allow a file that will be created later. There are 4 slots; free any you no longer need, and re-arm them after a reconnect. `--once` frees its slot after the first match; it does not end a run or close the app.
 
