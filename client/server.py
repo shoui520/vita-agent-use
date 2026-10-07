@@ -523,7 +523,7 @@ class AgentServer:
             import argparse
             import vita_agent
             values=args.copy()
-            for field in ('source','file','output','transfer_state','candidate','plan','macro_store'):
+            for field in ('source','file','output','transfer_state','candidate','plan','macro_store','state','credentials','device_dir'):
                 if values.get(field) is not None:values[field]=Path(values[field])
             options=argparse.Namespace(**values)
             if self.runs.busy() and (options.group in ('app','input','touch','macro','config','content','decrypt') or (options.group=='screen' and options.action!='capture') or (options.group=='fs' and options.action not in ('list','stat','download')) or options.group in ('call','session','performance')):raise ClientError('This command conflicts with the active run; status, events, metadata and captures remain available.')
