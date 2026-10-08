@@ -125,6 +125,7 @@ python3 client/vita_agent.py --help
 
 The agent can also use these tools when profiling or debugging:
 
+- [libperf](https://github.com/shoui520/libperf): CPU function and thread profiling on retail consoles
 - [psp2-cex-gpues4-prof](https://github.com/shoui520/psp2-cex-gpues4-prof): GPU profiling on retail consoles
 - [psp2_core_parse](https://github.com/shoui520/psp2_core_parse): analyze app crash dumps
 - [psp2_gpucrash_parse](https://github.com/shoui520/psp2_gpucrash_parse): analyze GPU crash dumps

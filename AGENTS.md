@@ -13,7 +13,7 @@ Read these when needed:
 | [call-schemas.md](docs/agent-reference/call-schemas.md) | Low-level `call` operations and their arguments |
 | [maintaining.md](docs/agent-reference/maintaining.md) | Source map and conventions for agents changing the code or this guide |
 
-Skills for external tools: [vita-gpuprof](docs/vita-gpuprof/SKILL.md) (GPU profiling), [vita-coredump](docs/vita-coredump/SKILL.md) (app crash dumps), [vita-gpucrash](docs/vita-gpucrash/SKILL.md) (GPUCRASH dumps), [vita-err](docs/vita-err/SKILL.md) (error codes).
+Skills for external tools: [vita-perf](docs/vita-perf/SKILL.md) (CPU profiling with libperf), [vita-gpuprof](docs/vita-gpuprof/SKILL.md) (GPU profiling), [vita-coredump](docs/vita-coredump/SKILL.md) (app crash dumps), [vita-gpucrash](docs/vita-gpucrash/SKILL.md) (GPUCRASH dumps), [vita-err](docs/vita-err/SKILL.md) (error codes).
 
 ## Rules
 
