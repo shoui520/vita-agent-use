@@ -71,7 +71,7 @@ int vau_connection_init(struct vau_connection *c, struct vau_service *s, uint64_
 		return VAU_INVALID;
 
 	memset(c, 0, sizeof(*c));
-	c->started_us = c->phase_us = c->last_us = now;
+	c->started_us = c->phase_us = c->last_us = c->last_rx_us = now;
 	if (vau_service_transport_poll(s) < 0) {
 		vau_connection_close(c);
 		return VAU_DENIED;
@@ -413,8 +413,8 @@ int vau_connection_feed(struct vau_connection *c, struct vau_service *s,
 		return VAU_INVALID;
 	}
 
-	if (!c->request.used)
-		c->phase_us = now;
+	/* Each arriving segment is progress: a slow link is not a dead one. */
+	c->phase_us = c->last_rx_us = now;
 
 	enum vau_http_state state = vau_http_feed(&c->request, bytes, size);
 
@@ -432,14 +432,58 @@ int vau_connection_feed(struct vau_connection *c, struct vau_service *s,
 	                 vau_protocol_background_request(c->request.data + c->request.header_bytes,
 	                                                 c->request.body_bytes);
 
+	int unavailable = 0;
+
 	if (!background && vau_service_poll(s) < 0) {
 		struct vau_session *session = vau_auth_lookup(
 		        &s->auth, c->request.token, VAU_TOKEN_HEX_BYTES, api->clock(api->context));
 
-		if (!session || !api->wake || api->wake(api->context) < 0 || vau_service_poll(s) < 0) {
+		if (!session || s->auth.stopped) {
 			vau_connection_close(c);
 			return VAU_DENIED;
 		}
+
+		/* The monitor often needs a moment after the display wakes. Answer
+		 * "not yet" over the intact connection instead of hanging up, so the
+		 * peer knows nothing ran and can simply ask again. */
+		if (api->wake)
+			(void)api->wake(api->context);
+
+		unavailable = vau_service_poll(s);
+		if (unavailable > 0)
+			unavailable = 0;
+	}
+
+	if (unavailable < 0) {
+		if (s->auth.stopped || vau_service_transport_poll(s) < 0) {
+			vau_connection_close(c);
+			return VAU_DENIED;
+		}
+
+		int body = vau_snprintf(c->output + VAU_CONNECTION_HEADER_BYTES, VAU_RESPONSE_BYTES,
+		                        "{\"v\":1,\"status\":\"error\",\"error\":\"service_unavailable\","
+		                        "\"error_code\":%d,\"retry\":true}",
+		                        unavailable);
+		int header =
+		        body < 0 ? body
+		                 : vau_http_response_header_ex(c->output, VAU_CONNECTION_HEADER_BYTES, 503,
+		                                               (size_t)body, !c->request.close_connection);
+
+		if (header < 0) {
+			vau_connection_close(c);
+			return VAU_DEVICE_ERROR;
+		}
+
+		memmove(c->output + header, c->output + VAU_CONNECTION_HEADER_BYTES, (size_t)body);
+		memcpy(c->push_token, c->request.token, sizeof(c->push_token));
+		++c->requests;
+		c->close_after_response =
+		        c->request.close_connection || c->requests >= VAU_CONNECTION_MAX_REQUESTS;
+		c->output_size = (size_t)header + (size_t)body;
+		c->output_sent = 0;
+		c->state       = VAU_CONNECTION_WRITING;
+		c->phase_us    = api->clock(api->context);
+		return VAU_OK;
 	}
 
 	if (!background && s->activity) {
@@ -494,10 +538,10 @@ int vau_connection_feed(struct vau_connection *c, struct vau_service *s,
 	++c->requests;
 	now = api->clock(api->context);
 
-	/* An authenticated capture can legitimately have no framebuffer. Return
-	 * that completed error without interrupting the session's event stream. */
-	c->close_after_response = c->reboot || c->request.close_connection ||
-	                          (status != 200 && !(c->request.frame_request && status == 500)) ||
+	/* Every reply here follows a completely framed request, so an ordinary
+	 * rejection (missing file, policy denial, no framebuffer) keeps the
+	 * session's connection and event stream. Only a dead grant ends it. */
+	c->close_after_response = c->reboot || c->request.close_connection || status == 401 ||
 	                          c->requests >= VAU_CONNECTION_MAX_REQUESTS;
 	if (c->file_response) {
 		struct vau_file_info *info = &c->file_chunk.info;
@@ -596,6 +640,7 @@ int vau_connection_written(struct vau_connection *c, struct vau_service *s, uint
 	}
 
 	c->output_sent += size;
+	c->phase_us = now;
 	if (c->output_sent == c->output_size) {
 		release_frame(c);
 		if (c->reboot) {

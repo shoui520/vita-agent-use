@@ -14,6 +14,11 @@
 #define VAU_RESPONSE_BYTES 4096u
 #define VAU_COMMAND_TOKENS 128u
 
+/* Lifetime granted by pairing, saved-peer sessions and session.extend. */
+#define VAU_SESSION_LIFETIME_US UINT64_C(3600000000)
+/* Session watches, runs and approvals outlive a dropped connection this long. */
+#define VAU_SESSION_GRACE_US UINT64_C(300000000)
+
 enum vau_session_right {
 	VAU_RIGHT_OBSERVE = 1u,
 	VAU_RIGHT_CONTROL = 2u
@@ -51,6 +56,7 @@ struct vau_session {
 	uint32_t tty_after, tty_dropped;
 	uint32_t dump_after, dialog_after, perf_after, dump_dropped, dialog_dropped, log_ids[4];
 	char run_id[33], run_title[VAU_TITLE_BYTES], run_phase[24];
+	uint64_t extend_until_us; /* Requested by session.extend; applied by the registry. */
 	uint64_t last_id;
 	unsigned char last_digest[32];
 	size_t reply_length;

@@ -218,6 +218,23 @@ int vau_authenticated_request(struct vau_auth *a, const struct vau_native_api *a
 		return vau_snprintf(out, cap, "{\"error\":\"unauthorized\"}");
 	}
 
-	*status = 200;
-	return vau_protocol_request(session, api, r->data + r->header_bytes, r->body_bytes, out, cap);
+	*status                  = 200;
+	session->extend_until_us = 0;
+
+	int n = vau_protocol_request(session, api, r->data + r->header_bytes, r->body_bytes, out, cap);
+
+	/* session.extend keeps the token, its replay cache and its watches. */
+	if (session->extend_until_us) {
+		for (unsigned i = 0; i < VAU_AUTH_SLOTS; ++i) {
+			struct vau_auth_entry *entry = &a->entries[i];
+
+			if (entry->handle && &entry->session == session &&
+			    session->extend_until_us > entry->expires_us)
+				entry->expires_us = session->extend_until_us;
+		}
+
+		session->extend_until_us = 0;
+	}
+
+	return n;
 }

@@ -12,7 +12,20 @@ int vau_log_watch(struct vau_log_watches *w, vau_file_stat_fn stat, vau_log_tail
                   const char *owner, uint32_t operation, const char *path, const char *marker,
                   uint32_t id, char *out, size_t cap)
 {
-	if (!w || !owner || strlen(owner) != 64 || !out || cap < 3500 || operation > 2)
+	if (!w || !owner || !out || cap < 3500 || operation > 3)
+		return VAU_INVALID;
+
+	/* Release every slot once the last session has ended, including slots a
+	 * physical stop orphaned by wiping the sessions that referenced them. */
+	if (operation == 3) {
+		memset(w->slots, 0, sizeof(w->slots));
+
+		int n = vau_snprintf(out, cap, "{\"released\":true}");
+
+		return n < 0 || (size_t)n >= cap ? VAU_DEVICE_ERROR : n;
+	}
+
+	if (strlen(owner) != 64)
 		return VAU_INVALID;
 
 	struct vau_log_watch_slot *slot = NULL;

@@ -80,7 +80,9 @@ enum {
 	OP_RUN_END,
 	OP_RUN_STATUS,
 	OP_DECRYPT,
-	OP_DECRYPT_STATUS
+	OP_DECRYPT_STATUS,
+	OP_SESSION_PING,
+	OP_SESSION_EXTEND
 };
 
 static const char *const operations[] = {
@@ -145,6 +147,8 @@ static const char *const operations[] = {
 	"run.status",
 	"decrypt.start",
 	"decrypt.status",
+	"session.ping",
+	"session.extend",
 };
 
 void vau_session_init(struct vau_session *s, unsigned rights)
@@ -402,7 +406,8 @@ static int parse(const char *json, size_t length, struct vau_command *out, struc
 
 	if (seen != 15)
 		return VAU_INVALID;
-	if (out->operation == OP_SUBSCRIBE || out->operation == OP_RUN_STATUS)
+	if (out->operation == OP_SUBSCRIBE || out->operation == OP_RUN_STATUS ||
+	    out->operation == OP_SESSION_PING || out->operation == OP_SESSION_EXTEND)
 		return t[args].next == args + 1 ? VAU_OK : VAU_INVALID;
 	if (out->operation >= OP_RUN_BEGIN && out->operation <= OP_RUN_END) {
 		unsigned found = 0;
@@ -1461,8 +1466,10 @@ static int request_locked(struct vau_session *s, const struct vau_native_api *ap
 		n = vau_snprintf(
 		        response, capacity,
 		        "{\"v\":1,\"id\":%s,\"status\":\"ok\",\"result\":{"
-		        "\"operations\":[\"capabilities\",\"system.snapshot\",\"app.launch\",\"app.close\",\"screen.on\",\"screen.off\",\"input.acquire\",\"input.heartbeat\",\"input.cancel\",\"input.release\",\"input.status\",\"input.submit\",\"fs.stat\",\"fs.list\",\"touch.panels\",\"system.reboot\",\"app.list\",\"fs.mkdir\",\"fs.move\",\"fs.trash\",\"fs.purge\",\"acl.request\",\"acl.status\",\"acl.audit\",\"macro.acquire\",\"plugins.list\",\"app.running\",\"performance.measure\",\"performance.watch\",\"performance.read\",\"performance.cancel\",\"events.start\",\"events.read\",\"events.stop\",\"livearea.schema\",\"log.start\",\"log.read\",\"log.stop\",\"content.list\",\"livearea.layout\",\"livearea.blob\",\"dialog.events.start\",\"dialog.events.read\",\"dialog.events.stop\",\"macro.enqueue\",\"content.delete.status\",\"content.delete.changes\",\"content.audit\",\"content.delete.preview\",\"content.scope\",\"content.delete.request\",\"content.albums\",\"app.install\",\"app.install.status\",\"events.subscribe\",\"run.begin\",\"run.update\",\"run.end\",\"run.status\",\"decrypt.start\",\"decrypt.status\"],"
+		        "\"operations\":[\"capabilities\",\"system.snapshot\",\"app.launch\",\"app.close\",\"screen.on\",\"screen.off\",\"input.acquire\",\"input.heartbeat\",\"input.cancel\",\"input.release\",\"input.status\",\"input.submit\",\"fs.stat\",\"fs.list\",\"touch.panels\",\"system.reboot\",\"app.list\",\"fs.mkdir\",\"fs.move\",\"fs.trash\",\"fs.purge\",\"acl.request\",\"acl.status\",\"acl.audit\",\"macro.acquire\",\"plugins.list\",\"app.running\",\"performance.measure\",\"performance.watch\",\"performance.read\",\"performance.cancel\",\"events.start\",\"events.read\",\"events.stop\",\"livearea.schema\",\"log.start\",\"log.read\",\"log.stop\",\"content.list\",\"livearea.layout\",\"livearea.blob\",\"dialog.events.start\",\"dialog.events.read\",\"dialog.events.stop\",\"macro.enqueue\",\"content.delete.status\",\"content.delete.changes\",\"content.audit\",\"content.delete.preview\",\"content.scope\",\"content.delete.request\",\"content.albums\",\"app.install\",\"app.install.status\",\"events.subscribe\",\"run.begin\",\"run.update\",\"run.end\",\"run.status\",\"decrypt.start\",\"decrypt.status\",\"session.ping\",\"session.extend\"],"
 		        "\"request_bytes_max\":131072,\"response_bytes_max\":4096,"
+		        "\"session\":{\"ping\":\"session.ping\",\"extend\":\"session.extend\",\"lifetime_us\":%llu,"
+		        "\"connection_grace_us\":%llu,\"error_keep_alive\":true,\"retry_status\":503},"
 		        "\"content_delete\":{\"kinds\":[\"application\",\"vita_savedata\"],\"savedata_user_min\":0,\"savedata_user_max\":63,\"requires_preview\":true,\"requires_physical_ok\":true},"
 		        "\"id_order\":\"strictly_increasing_decimal_strings\",\"cached_replies\":1,"
 		        "\"plugins\":{\"page_entries_max\":2,\"source\":\"native_module_lists\",\"categories\":\"taihen_config_sections\"},"
@@ -1476,7 +1483,23 @@ static int request_locked(struct vau_session *s, const struct vau_native_api *ap
 		        "\"contact_fields\":[\"id\",\"force\",\"x\",\"y\"],"
 		        "\"event_fields\":[\"at_us\",\"buttons\",\"lx\",\"ly\",\"rx\",\"ry\"],"
 		        "\"applied_means\":\"native_api_accepted\"},\"macros\":{\"acquire\":\"macro.acquire\",\"binding\":\"title_id\"},\"performance\":{\"measure\":\"performance.measure\",\"watch\":\"performance.watch\",\"read\":\"performance.read\",\"cancel\":\"performance.cancel\",\"window_ms_min\":100,\"window_ms_max\":60000,\"watch_seconds_max\":3600,\"sample_interval_ms\":1000,\"retained_samples\":64,\"core_order\":[\"CPU0\",\"CPU1\",\"CPU2\",\"CPU3\"]}}}",
-		        id, VAU_UPLOAD_CHUNK_BYTES);
+		        id, (unsigned long long)VAU_SESSION_LIFETIME_US,
+		        (unsigned long long)VAU_SESSION_GRACE_US, VAU_UPLOAD_CHUNK_BYTES);
+	} else if (command->operation == OP_SESSION_PING) {
+		n = vau_snprintf(response, capacity,
+		                 "{\"v\":1,\"id\":%s,\"status\":\"ok\",\"result\":{\"now_us\":\"%llu\"}}",
+		                 id, (unsigned long long)api->clock(api->context));
+	} else if (command->operation == OP_SESSION_EXTEND) {
+		/* The registry applies this after the reply is built; the holder of a
+		 * live grant over its pinned channel may keep it alive in place. */
+		uint64_t now = api->clock(api->context);
+
+		s->extend_until_us = now + VAU_SESSION_LIFETIME_US;
+		n                  = vau_snprintf(
+                response, capacity,
+                "{\"v\":1,\"id\":%s,\"status\":\"ok\",\"result\":{\"lifetime_us\":\"%llu\",\"expires_us\":\"%llu\"}}",
+                id, (unsigned long long)VAU_SESSION_LIFETIME_US,
+                (unsigned long long)s->extend_until_us);
 	} else if (command->operation == OP_SUBSCRIBE) {
 		char result[3500];
 		int got = api->events ? api->events(api->context, 0, 0, result, sizeof(result))
@@ -1497,8 +1520,10 @@ static int request_locked(struct vau_session *s, const struct vau_native_api *ap
 			s->dump_after = s->dialog_after = 0;
 			n                               = vau_snprintf(
                     response, capacity,
-                    "{\"v\":1,\"id\":%s,\"status\":\"ok\",\"result\":{\"transport\":\"persistent_tls_push\",\"coredumps\":true,\"tty\":%s}}",
-                    id, result);
+                    "{\"v\":1,\"id\":%s,\"status\":\"ok\",\"result\":{\"transport\":\"persistent_tls_push\",\"coredumps\":true,"
+			                                      "\"session\":{\"ping\":true,\"extend\":true,\"lifetime_us\":\"%llu\",\"connection_grace_us\":\"%llu\"},\"tty\":%s}}",
+                    id, (unsigned long long)VAU_SESSION_LIFETIME_US,
+                    (unsigned long long)VAU_SESSION_GRACE_US, result);
 		}
 	} else if (command->operation >= OP_RUN_BEGIN && command->operation <= OP_RUN_STATUS) {
 		rc = VAU_OK;
@@ -2043,8 +2068,10 @@ int vau_protocol_background_request(const char *request, size_t length)
 	if (!request || atomic_flag_test_and_set_explicit(&workspace_busy, memory_order_acquire))
 		return 0;
 
-	int rc         = parse(request, length, &workspace.command, workspace.tokens);
-	int background = rc == VAU_OK && workspace.command.operation == OP_SUBSCRIBE;
+	int rc             = parse(request, length, &workspace.command, workspace.tokens);
+	unsigned operation = workspace.command.operation;
+	int background = rc == VAU_OK && (operation == OP_SUBSCRIBE || operation == OP_SESSION_PING ||
+	                                  operation == OP_SESSION_EXTEND);
 
 	atomic_flag_clear_explicit(&workspace_busy, memory_order_release);
 	return background;

@@ -44,7 +44,8 @@ static struct vau_pairing_worker ui;
 static struct vau_pairing_flow flow;
 static struct vau_pairing_grant resumed_grant;
 static struct vau_notification_worker notifications;
-static struct vau_net_socket listener, client;
+/* handoff: an admission request the command loop accepted for pair_once. */
+static struct vau_net_socket listener, client, handoff;
 static struct vau_net_waiter waiter;
 static unsigned char certificate[VAU_TLS_CREDENTIAL_BYTES], key[VAU_TLS_CREDENTIAL_BYTES],
         peer[VAU_TLS_CREDENTIAL_BYTES];
@@ -93,15 +94,106 @@ static int log_event(const char *stage, int result, int detail)
 static void network_event(unsigned stage, int result, int detail)
 {
 	vau_diagnostics_network(stage, result, detail);
-	if (stage == 5 || stage == 6)
+	/* Pushed performance belongs to the session, which outlives a dropped
+	 * connection for the grace period. */
+	if (stage == 6 || stage == 12)
 		vau_performance_stop();
-	if (stage == 5 || stage == 6 || stage == 7 || stage == 8) {
-		log_event(stage == 5   ? "connection closed"
-		          : stage == 6 ? "command service closed"
-		          : stage == 7 ? "input monitor unavailable"
-		                       : "input monitor recovered",
+	if ((stage >= 5 && stage <= 8) || (stage >= 10 && stage <= 12)) {
+		log_event(stage == 5    ? "connection closed"
+		          : stage == 6  ? "command service closed"
+		          : stage == 7  ? "input monitor unavailable"
+		          : stage == 8  ? "input monitor recovered"
+		          : stage == 10 ? "command network reset"
+		          : stage == 11 ? "commands listening again"
+		                        : "session grace ended",
 		          result, detail);
 	}
+}
+
+/* The longest a PC waits for admission (session pair allows 75 s). A request
+ * queued for longer was abandoned by its PC. */
+#define ADMISSION_ABANDONED_US UINT64_C(80000000)
+#define ADMISSION_POLL_US      UINT64_C(1000000)
+
+static uint64_t admission_seen_us, admission_poll_us, admission_relisten_us, admission_reset_us;
+static unsigned admission_resets, admission_spurious;
+
+/* Called from the command loop. Returns 1 when an admission request was
+ * accepted into handoff and should take over, 0 to keep serving commands,
+ * negative when the listener cannot be recovered safely. While hand-over is
+ * impossible it only notes when a request started waiting, at most once per
+ * second. A listener killed by a network reset also polls readable, so only a
+ * successful accept counts as a request. */
+static int admission_check(int hand_over)
+{
+	uint64_t now = now_us();
+
+	if (listener.fd < 0) {
+		if (now < admission_relisten_us)
+			return 0;
+		admission_relisten_us = now + ADMISSION_POLL_US;
+		if (vau_net_listen(&listener, PAIR_PORT) < 0)
+			return 0;
+		log_event("pairing listening again", PAIR_PORT, 0);
+	}
+	if (!hand_over && now < admission_poll_us)
+		return 0;
+	admission_poll_us = now + ADMISSION_POLL_US;
+
+	int waiting = vau_net_wait(&waiter, &listener, 0, 0);
+
+	if (!waiting) {
+		admission_seen_us = 0;
+		return 0;
+	}
+	if (waiting > 0) {
+		if (!admission_seen_us)
+			admission_seen_us = now;
+		if (!hand_over)
+			return 0;
+
+		uint64_t age = now - admission_seen_us;
+
+		waiting = vau_net_accept(&listener, &handoff);
+		if (!waiting) {
+			admission_seen_us  = 0;
+			admission_spurious = 0;
+			if (age < ADMISSION_ABANDONED_US)
+				return 1;
+
+			/* Ending every session for a PC that already gave up helps nobody. */
+			vau_net_close(&handoff);
+			log_event("abandoned admission dropped", 0, 0);
+			return 0;
+		}
+		if (waiting == 1) {
+			if (++admission_spurious < 3)
+				return 0;
+			waiting = VAU_DEVICE_ERROR;
+		}
+	}
+
+	/* A Wi-Fi reconnect invalidates this listener too. Reopen it in place of
+	 * leaving command mode, which would end every session. */
+	admission_spurious = 0;
+	log_event("pairing listener reset", waiting, waiter.error ? waiter.error : listener.error);
+	if (vau_net_waiter_detach(&waiter) < 0 &&
+	    (vau_net_waiter_close(&waiter) < 0 || vau_net_waiter_open(&waiter) < 0))
+		return waiting;
+	vau_net_close(&listener);
+	admission_seen_us = 0;
+
+	/* Repeated resets back off to 4 s apart, like the command listener. */
+	if (admission_resets && now - admission_reset_us >= UINT64_C(10000000))
+		admission_resets = 0;
+
+	unsigned shift = admission_resets < 3 ? admission_resets : 3;
+
+	admission_relisten_us = now + (shift ? ADMISSION_POLL_US << (shift - 1) : 0);
+	admission_reset_us    = now;
+	if (admission_resets < 3)
+		++admission_resets;
+	return 0;
 }
 
 static void notice_event(int result, int pending)
@@ -410,7 +502,9 @@ static int pair_once(void)
 	if (rc < 0)
 		return rc;
 
-	vau_net_socket_init(&client);
+	/* The command loop may already have accepted the waiting request. */
+	client = handoff;
+	vau_net_socket_init(&handoff);
 	vau_net_waiter_init(&waiter);
 	rc = vau_net_waiter_open(&waiter);
 	if (rc >= 0 && listener.fd < 0) {
@@ -430,17 +524,19 @@ static int pair_once(void)
 		prevent_auto_suspend();
 		(void)vau_service_poll(&service);
 		vau_vita_approval_poll(NULL);
-		rc = vau_net_wait(&waiter, &listener, 0, 16000);
-		if (rc < 0)
-			goto done;
-		if (!rc)
-			continue;
+		if (client.fd < 0) {
+			rc = vau_net_wait(&waiter, &listener, 0, 16000);
+			if (rc < 0)
+				goto done;
+			if (!rc)
+				continue;
 
-		rc = vau_net_accept(&listener, &client);
-		if (rc == 1)
-			continue;
-		if (rc < 0)
-			goto done;
+			rc = vau_net_accept(&listener, &client);
+			if (rc == 1)
+				continue;
+			if (rc < 0)
+				goto done;
+		}
 		if (vau_net_waiter_detach(&waiter) < 0) {
 			rc = VAU_DEVICE_ERROR;
 			goto done;
@@ -605,6 +701,7 @@ static int runtime_thread(SceSize args, void *argp)
 	(void)args;
 	(void)argp;
 	vau_net_socket_init(&listener);
+	vau_net_socket_init(&handoff);
 	(void)vau_diagnostics_start();
 
 	SceIoStat directory_stat = { 0 };
@@ -724,22 +821,22 @@ static int runtime_thread(SceSize args, void *argp)
 			rc = vau_net_waiter_open(&waiter);
 			if (rc < 0)
 				stop_runtime("network cleanup stopped", rc);
+			admission_seen_us = admission_poll_us = 0;
 
 			while (network.commands.running) {
 				/* A new pairing/session connection waits in the listener backlog
 				 * until the current command connection and native work release it.
 				 * This reuses the existing TLS arena and preserves live operations. */
-				if (!network.commands.connected && !vau_vita_install_busy() &&
-				    !vau_vita_decrypt_busy() && !vau_vita_content_inflight()) {
-					int waiting = vau_net_wait(&waiter, &listener, 0, 0);
+				int waiting =
+				        admission_check(!network.commands.connected && !vau_vita_install_busy() &&
+				                        !vau_vita_decrypt_busy() && !vau_vita_content_inflight());
 
-					if (waiting < 0) {
-						network.commands.error = waiting;
-						break;
-					}
-					if (waiting > 0)
-						break;
+				if (waiting < 0) {
+					network.commands.error = waiting;
+					break;
 				}
+				if (waiting > 0)
+					break;
 
 				prevent_auto_suspend();
 				(void)vau_command_worker_step(&network.commands);

@@ -8,9 +8,13 @@
 
 #include "service.h"
 
-#define VAU_CONNECTION_IDLE_US      UINT64_C(1800000000)
-#define VAU_CONNECTION_MESSAGE_US   UINT64_C(5000000)
-#define VAU_CONNECTION_LIFETIME_US  UINT64_C(3600000000)
+#define VAU_CONNECTION_IDLE_US UINT64_C(1800000000)
+/* A request or response may take any time while bytes keep moving; only a
+ * transfer with no progress for this long is abandoned. */
+#define VAU_CONNECTION_MESSAGE_US UINT64_C(20000000)
+/* Grants carry their own expiry and can be extended in place, so the
+ * connection itself only has the registry's maximum lifetime. */
+#define VAU_CONNECTION_LIFETIME_US  UINT64_C(86400000000)
 #define VAU_CONNECTION_MAX_REQUESTS 65536u
 #define VAU_CONNECTION_HEADER_BYTES 512u
 
@@ -30,6 +34,7 @@ struct vau_connection {
 
 	void *frame_context;
 	uint64_t started_us, phase_us, last_us, generation;
+	uint64_t last_rx_us; /* Last byte from the peer; silent peers can be replaced. */
 	unsigned requests, close_after_response, file_response, audit_response, upload_response;
 	uint64_t file_offset, push_due_us;
 	uint64_t upload_open_us, upload_work_us, upload_close_us;

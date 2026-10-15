@@ -298,18 +298,22 @@ static int response_header(char *out, size_t capacity, unsigned status, size_t b
 	case 415: reason = "Unsupported Media Type"; break;
 	case 431: reason = "Request Header Fields Too Large"; break;
 	case 500: reason = "Internal Server Error"; break;
+	case 503: reason = "Service Unavailable"; break;
 	default: return VAU_INVALID;
 	}
 
 	if (!out || !capacity || body_bytes > limit || keep_alive > 1)
 		return VAU_INVALID;
 
+	/* A complete, framed error leaves the stream in sync, so only a dead grant
+	 * ends the connection. Dropping it for an ordinary rejection would also
+	 * interrupt the session's pushed events. */
 	int n = vau_snprintf(out, capacity,
 	                     "HTTP/1.1 %u %s\r\nContent-Type: application/json\r\n"
 	                     "Content-Length: %u\r\nConnection: %s\r\nCache-Control: no-store\r\n"
 	                     "X-Content-Type-Options: nosniff\r\n\r\n",
 	                     status, reason, (unsigned)body_bytes,
-	                     keep_alive && (status == 200 || status == 500) ? "keep-alive" : "close");
+	                     keep_alive && status != 401 ? "keep-alive" : "close");
 
 	return n < 0 || (size_t)n >= capacity ? VAU_INVALID : n;
 }

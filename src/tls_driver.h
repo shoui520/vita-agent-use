@@ -9,7 +9,7 @@
 #include "connection.h"
 #include <mbedtls/ssl.h>
 
-#define VAU_TLS_HANDSHAKE_US UINT64_C(10000000)
+#define VAU_TLS_HANDSHAKE_US UINT64_C(20000000)
 
 enum vau_tls_work {
 	VAU_TLS_RUN,

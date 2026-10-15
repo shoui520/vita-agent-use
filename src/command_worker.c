@@ -18,9 +18,11 @@ static void trace(struct vau_command_worker *w, unsigned stage, int result, int 
 	}
 }
 
-static int disconnect(struct vau_command_worker *w)
+/* Session-owned work (log watches, pushed performance, the run tag and any
+ * native approval) belongs to the grant, not to one TCP connection. It is
+ * released only once the session ends or its peer stays away for the grace. */
+static void release_sessions(struct vau_command_worker *w)
 {
-	trace(w, 5, w->driver.error, w->client.error);
 	for (unsigned i = 0; i < VAU_AUTH_SLOTS; i++) {
 		struct vau_session *session = &w->service->auth.entries[i].session;
 
@@ -46,6 +48,13 @@ static int disconnect(struct vau_command_worker *w)
 
 	if (w->api->approval_cancel)
 		w->api->approval_cancel(w->api->context);
+}
+
+static int disconnect(struct vau_command_worker *w)
+{
+	trace(w, 5, w->driver.error, w->client.error);
+	if (w->connected && !w->disconnected_us)
+		w->disconnected_us = w->api->clock(w->api->context);
 	if (w->connected)
 		vau_tls_driver_close(&w->driver, w->driver.error);
 	w->connected = 0;
@@ -57,6 +66,42 @@ static int disconnect(struct vau_command_worker *w)
 	return rc;
 }
 
+/* A Wi-Fi reconnect invalidates every socket (SCE_NET_ERROR_EIPADDRCHANGED),
+ * the listener included. Grants are not tied to a socket, so drop the dead
+ * ones, keep every session and listen again; the PC then resumes the same
+ * session once the network returns. */
+static int network_reset(struct vau_command_worker *w, uint64_t now)
+{
+	trace(w, 10, w->client.error ? w->client.error : w->listener.error, w->waiter.error);
+	if (w->connected) {
+		trace(w, 5, w->driver.error, w->client.error);
+		if (!w->disconnected_us)
+			w->disconnected_us = now;
+		vau_tls_driver_close(&w->driver, w->driver.error);
+		w->connected = 0;
+	}
+
+	/* Destroying the epoll instance drops interest it could not detach, after
+	 * which the socket may be closed. */
+	if (vau_net_waiter_detach(&w->waiter) < 0 && vau_net_waiter_close(&w->waiter) < 0)
+		return VAU_DEVICE_ERROR;
+
+	vau_net_close(&w->client);
+	vau_net_close(&w->listener);
+
+	/* The first reset reopens at once; repeats back off to bound the log. */
+	if (w->resets && now - w->reset_us >= VAU_WORKER_RESET_QUIET_US)
+		w->resets = 0;
+
+	unsigned shift = w->resets < 3 ? w->resets : 3;
+
+	w->relisten_us = now + (shift ? VAU_WORKER_RELISTEN_US << (shift - 1) : 0);
+	w->reset_us    = now;
+	if (w->resets < 3)
+		++w->resets;
+	return VAU_OK;
+}
+
 int vau_command_worker_close(struct vau_command_worker *w, int error)
 {
 	if (!w || !w->initialized)
@@ -64,6 +109,10 @@ int vau_command_worker_close(struct vau_command_worker *w, int error)
 
 	w->running = 0;
 	w->error   = error;
+
+	/* Release watches while sessions still name them; stopping wipes them. */
+	release_sessions(w);
+	w->disconnected_us = 0;
 	if (!w->service->auth.stopped)
 		vau_auth_stop(&w->service->auth);
 	if (w->notifications)
@@ -72,6 +121,14 @@ int vau_command_worker_close(struct vau_command_worker *w, int error)
 	int rc = disconnect(w);
 
 	trace(w, 6, error, w->waiter.error);
+
+	/* A physical stop may already have wiped the sessions that referenced
+	 * watch slots. Every session has ended here, so free all of them. */
+	if (w->api->log_watch) {
+		char result[3500];
+
+		(void)w->api->log_watch(w->api->context, "", 3, NULL, NULL, 0, result, sizeof(result));
+	}
 
 	int closed = vau_net_waiter_close(&w->waiter);
 
@@ -115,6 +172,7 @@ int vau_command_worker_init(struct vau_command_worker *w, struct vau_service *s,
 	w->api         = api;
 	w->server      = server;
 	w->initialized = 1;
+	w->port        = port;
 	vau_net_socket_init(&w->listener);
 	vau_net_socket_init(&w->client);
 	vau_net_waiter_init(&w->waiter);
@@ -160,6 +218,20 @@ static int fail(struct vau_command_worker *w, int error)
 	return error;
 }
 
+static int recover_network(struct vau_command_worker *w, uint64_t now)
+{
+	return network_reset(w, now) < 0 ? fail(w, VAU_DEVICE_ERROR) : VAU_OK;
+}
+
+static int pause_until(struct vau_command_worker *w, uint64_t now, uint64_t until)
+{
+	uint64_t remaining = until - now;
+	int rc             = vau_net_pause(remaining < VAU_WORKER_WAIT_US ? (unsigned)remaining
+	                                                                  : VAU_WORKER_WAIT_US);
+
+	return rc < 0 ? fail(w, rc) : VAU_OK;
+}
+
 int vau_command_worker_step(struct vau_command_worker *w)
 {
 	if (!w || !w->running)
@@ -200,20 +272,34 @@ int vau_command_worker_step(struct vau_command_worker *w)
 
 	if (w->notifications)
 		(void)vau_notification_worker_poll(w->notifications, now);
+	if (!w->connected && w->disconnected_us && now - w->disconnected_us >= VAU_SESSION_GRACE_US) {
+		release_sessions(w);
+		w->disconnected_us = 0;
+		trace(w, 12, 0, 0);
+	}
+
 	if (!w->connected) {
 		trace(w, 1, 0, 0);
-		if (now < w->next_accept_us) {
-			uint64_t remaining = w->next_accept_us - now;
-			int rc             = vau_net_pause(remaining < VAU_WORKER_WAIT_US ? (unsigned)remaining
-			                                                                  : VAU_WORKER_WAIT_US);
+		if (w->listener.fd < 0 || w->waiter.id < 0) {
+			if (now < w->relisten_us)
+				return pause_until(w, now, w->relisten_us);
 
-			return rc < 0 ? fail(w, rc) : VAU_OK;
+			/* Retry each second while the network is still down. */
+			w->relisten_us = now + VAU_WORKER_RELISTEN_US;
+			if (w->waiter.id < 0 && vau_net_waiter_open(&w->waiter) < 0)
+				return VAU_OK;
+			if (w->listener.fd < 0 && vau_net_listen(&w->listener, w->port) < 0)
+				return VAU_OK;
+			trace(w, 11, 0, 0);
+			return VAU_OK;
 		}
+		if (now < w->next_accept_us)
+			return pause_until(w, now, w->next_accept_us);
 
 		int ready = vau_net_wait(&w->waiter, &w->listener, 0, VAU_WORKER_WAIT_US);
 
 		if (ready < 0)
-			return fail(w, ready);
+			return recover_network(w, now);
 		if (!ready)
 			return VAU_OK;
 		if (!live_grant(w->service, w->api->clock(w->api->context)))
@@ -229,7 +315,7 @@ int vau_command_worker_step(struct vau_command_worker *w)
 		if (rc == 1)
 			return VAU_OK;
 		if (rc < 0)
-			return fail(w, rc);
+			return recover_network(w, now);
 
 		now = w->api->clock(w->api->context);
 		if (now < w->last_us || now > UINT64_MAX - VAU_WORKER_ADMISSION_US)
@@ -238,7 +324,7 @@ int vau_command_worker_step(struct vau_command_worker *w)
 		w->last_us        = now;
 		w->next_accept_us = now + VAU_WORKER_ADMISSION_US;
 		if (vau_net_waiter_detach(&w->waiter) < 0)
-			return fail(w, VAU_DEVICE_ERROR);
+			return recover_network(w, now);
 		if (vau_tls_server_reset(w->server) < 0)
 			return fail(w, VAU_DEVICE_ERROR);
 
@@ -256,12 +342,39 @@ int vau_command_worker_step(struct vau_command_worker *w)
 	      : w->driver.connection.state == VAU_CONNECTION_READING ? 3
 	                                                             : 4,
 	      0, 0);
+
+	struct vau_connection *c = &w->driver.connection;
+
+	/* A served request proves the peer came back within the grace. */
+	if (w->disconnected_us && w->driver.active && c->requests)
+		w->disconnected_us = 0;
+
+	/* Only the paired PC holds this listener's certificate, so a waiting
+	 * connection while the current one has gone silent means that PC lost the
+	 * old one without the Vita seeing it close. Hand over instead of making it
+	 * wait for the idle limit. */
+	if (w->driver.active && c->state == VAU_CONNECTION_READING && !c->request.used &&
+	    now >= c->last_rx_us && now - c->last_rx_us >= VAU_WORKER_PREEMPT_US &&
+	    now >= w->preempt_check_us) {
+		w->preempt_check_us = now + VAU_WORKER_ADMISSION_US;
+
+		int waiting = vau_net_wait(&w->waiter, &w->listener, 0, 0);
+
+		if (waiting < 0)
+			return recover_network(w, now);
+		if (waiting > 0) {
+			trace(w, 9, 0, 0);
+			if (disconnect(w) < 0)
+				return recover_network(w, now);
+			return VAU_OK;
+		}
+	}
 	if (w->driver.work == VAU_TLS_WAIT_READ || w->driver.work == VAU_TLS_WAIT_WRITE) {
 		int ready = vau_net_wait(&w->waiter, &w->client, w->driver.work == VAU_TLS_WAIT_WRITE,
 		                         VAU_WORKER_WAIT_US);
 
 		if (ready < 0)
-			return fail(w, ready);
+			return recover_network(w, now);
 
 		now = w->api->clock(w->api->context);
 		if (now < w->last_us)
@@ -274,7 +387,7 @@ int vau_command_worker_step(struct vau_command_worker *w)
 		return fail(w, VAU_EXPIRED);
 	if (vau_tls_driver_step(&w->driver, w->service, w->api, now) == VAU_TLS_CLOSED) {
 		if (disconnect(w) < 0)
-			return fail(w, VAU_DEVICE_ERROR);
+			return recover_network(w, now);
 	}
 
 	return VAU_OK;
