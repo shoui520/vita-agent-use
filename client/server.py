@@ -19,26 +19,35 @@ import socket
 import socketserver
 import sys
 import threading
+import signal
 import time
 import uuid
-from vita_client import ClientError, NativeFrameError, UploadError, UploadTransportError, VitaClient, durable_json, private_json, strict_json, screen_off_if_idle, connection_setup_hint, upload_wait_timeout
+from vita_client import ClientError, NativeFrameError, UncertainOutcomeError, UploadError, VitaClient, durable_json, private_json, strict_json, screen_off_if_idle, connection_setup_hint, read_unresolved, unresolved_path
 
 IPC_IDLE_TIMEOUT = 65
+# Sent while a command runs, so a long recovery never looks like a hang.
+IPC_KEEPALIVE = 10
+# Idle heartbeat: keeps the connection from looking dead to the Vita (it
+# retires a silent connection after 30 s once another one is waiting).
+HEARTBEAT_S = 15
+# Extend the token this long before it expires.
+EXTEND_MARGIN_S = 600
+# A run survives a dropped connection this long when the plugin keeps
+# session state across reconnects.
+RUN_RECONNECT_WAIT = 90
 MAX_IPC = 1024 * 1024
 MAX_FRAME = 2 * 1024 * 1024
 TERMINAL = {'completed', 'cancelled', 'failed', 'connection_lost'}
-# Explicit observations and idempotent transport setup only. Never infer safety
-# from a method's spelling, and never replay writes/input/app control here.
-RETRYABLE_OPS = frozenset({
-    'capabilities', 'system.snapshot', 'app.running', 'app.list', 'fs.stat',
-    'fs.list', 'plugins.list', 'touch.panels', 'livearea.schema', 'livearea.layout',
-    'performance.read', 'events.read', 'dialog.events.read', 'input.status',
-    'run.status', 'acl.status', 'acl.audit', 'content.list', 'content.scope',
-    'content.albums', 'content.audit', 'content.delete.status',
-    'content.delete.changes', 'livearea.blob', 'app.install.status',
-    'screen.on', 'screen.off',
-    'events.subscribe',
-})
+
+
+@contextlib.contextmanager
+def recovery_limit(client, seconds):
+    limit = getattr(client, 'recovery_limit', None)
+    if limit is None:
+        yield
+    else:
+        with limit(seconds):
+            yield
 
 
 def checked(reply):
@@ -139,53 +148,23 @@ class PushTransport:
 
 
 class ServerClient(VitaClient):
-    def __init__(self,*args,event_sink,disconnect_sink,**kwargs):
+    """Every connection is a push transport; the server sees loss and recovery."""
+    def __init__(self,*args,event_sink,disconnect_sink,call_sink=None,**kwargs):
         super().__init__(*args,**kwargs)
-        self.event_sink,self.disconnect_sink=event_sink,disconnect_sink
-        self.command_ready_until=0
+        self.event_sink,self.disconnect_sink,self.call_sink=event_sink,disconnect_sink,call_sink
     def _close_transport(self):
         had_connection=self._connection is not None
         super()._close_transport()
         if had_connection:self.disconnect_sink('Protected transport closed; pending effects retain their recovery state.')
     def _connect(self):
-        # Saved-session acknowledgement precedes command-listener startup.
-        # Only refused TCP connections can be retried here: no command has
-        # been sent, and a TLS timeout is a separate failure to diagnose.
-        while True:
-            try:
-                connection=super()._connect()
-                break
-            except ConnectionRefusedError:
-                remaining=self.command_ready_until-time.monotonic()
-                if remaining<=0:raise
-                time.sleep(min(1,remaining))
-        self.command_ready_until=0
+        connection=super()._connect()
         self._connection=PushTransport(connection,self.event_sink,self.disconnect_sink)
         return self._connection
-
-
-class UploadClient:
-    """Renew between serialized steps; replay only the same durable upload ID."""
-    def __init__(self,server):self.server=server
-    def __getattr__(self,name):return getattr(self.server.client,name)
-    def upload_step(self,request,action,offset=0,data=b'',*,progress=None):
-        server=self.server
-        for attempt in range(3):
-            session=server._session_status()
-            reserve=upload_wait_timeout(request,action,server.client.timeout)+60
-            if not server.connected:server._reconnect()
-            elif server._renew_due() or (session['expires_in_s'] is not None and session['expires_in_s']<reserve):
-                server._new_session()
-            try:
-                reply=server.client.upload_step(request,action,offset,data,progress=progress)
-                server.last_activity=time.monotonic()
-                return reply
-            except UploadTransportError:
-                if attempt==2:raise
-                # Native staging compares overlapping chunks; commit/recover
-                # look up this ID's journal. No new operation is created.
-                server.connected=False
-                if progress is not None:progress()
+    def _call_raw(self,op,args=None):
+        result=super()._call_raw(op,args)
+        if self.call_sink is not None and not self._recovering and op!='events.subscribe':
+            self.call_sink()
+        return result
 
 
 class EventStore:
@@ -278,7 +257,13 @@ class RunCoordinator:
     def on_event(self,event):
         with self.guard:
             if not self.busy():return
-            if event.get('type')=='connection.lost':self.failure='connection_lost';self.completion.set()
+            if event.get('type')=='connection.lost':
+                # With session grace the native run survives a reconnect;
+                # the worker gives the connection RUN_RECONNECT_WAIT to return.
+                if not self.server.features.get('connection_grace_us'):
+                    self.failure='connection_lost';self.completion.set()
+            elif event.get('type')=='session.renewed':
+                self.failure='connection_lost';self.completion.set()
             elif event['type'] in ('coredump.saving','coredump.complete') and int(event.get('observed_us','0'))>=int(self.active.get('native_started_us') or '0'):
                 pending=self.active.get('coredump')
                 matching=pending and event.get('path')==pending['path'].removesuffix('.tmp')
@@ -342,15 +327,20 @@ class RunCoordinator:
             self._check()
             log=spec.get('completion',{}).get('log')
             if log:
-                self.watch_id=checked(c.call('log.start',{'path':log['path'],'marker':log['literal']}))['watch_id']
-                self.server.logs[self.watch_id]={'path':log['path'],'marker':log['literal'],'run_id':run['run_id']}
+                native=checked(c.call('log.start',{'path':log['path'],'marker':log['literal']}))['watch_id']
+                self.watch_id=self.server.register_watch(native,log['path'],log['literal'],run_id=run['run_id'])
             self._phase('armed');self._phase('launching')
             if self.watch_id:self.server.logs[self.watch_id]['armed']=True
             reply=c.call('app.launch',{'title_id':run['title_id']});launched=True
             checked(reply)
             if not reply.get('result',{}).get('confirmed'):raise ClientError('Launch was not confirmed.')
             self._check();self._phase('running')
-            if not self.completion.wait(spec.get('timeout_s',120)):raise TimeoutError('Completion marker timed out.' if log else 'Run timed out.')
+            deadline=time.monotonic()+spec.get('timeout_s',120)
+            while not self.completion.wait(max(0,min(1,deadline-time.monotonic()))):
+                lost=self.server.lost_at
+                if not self.server.connected and lost is not None and time.monotonic()-lost>=RUN_RECONNECT_WAIT:
+                    self.failure='connection_lost';break
+                if time.monotonic()>=deadline:raise TimeoutError('Completion marker timed out.' if log else 'Run timed out.')
             self._check()
             self._phase('closing')
             if spec.get('close_on_completion',True):self._close_app(run['title_id']);launched=False
@@ -368,22 +358,23 @@ class RunCoordinator:
                     if not self.server.connected or self.server.closing.is_set():break
             dump_pending=crashed and not self.dump_complete.is_set()
             if self.server.connected and not dump_pending:
-                if self.watch_id:
-                    try:checked(c.call('log.stop',{'watch_id':self.watch_id}))
-                    except Exception as exc:cleanup.append(str(exc))
-                    self.server.logs.pop(self.watch_id,None)
-                if launched and spec.get('close_on_completion',True):
-                    try:self._close_app(run['title_id'])
-                    except Exception as exc:cleanup.append(str(exc))
-                if perf:
-                    try:checked(c.call('performance.cancel'))
-                    except Exception as exc:cleanup.append(str(exc))
-                if begun:
-                    try:checked(c.call('run.end',{'run_id':run['run_id'],'phase':phase}))
-                    except Exception as exc:cleanup.append(str(exc))
-                if self.server.screen_off_when_done and not self.server.background_screen_busy():
-                    try:screen_off_if_idle(c)
-                    except Exception as exc:cleanup.append(str(exc))
+                with recovery_limit(c,15):
+                    if self.watch_id:
+                        native=self.server.unregister_watch(self.watch_id)
+                        try:checked(c.call('log.stop',{'watch_id':native}))
+                        except Exception as exc:cleanup.append(str(exc))
+                    if launched and spec.get('close_on_completion',True):
+                        try:self._close_app(run['title_id'])
+                        except Exception as exc:cleanup.append(str(exc))
+                    if perf:
+                        try:checked(c.call('performance.cancel'))
+                        except Exception as exc:cleanup.append(str(exc))
+                    if begun:
+                        try:checked(c.call('run.end',{'run_id':run['run_id'],'phase':phase}))
+                        except Exception as exc:cleanup.append(str(exc))
+                    if self.server.screen_off_when_done and not self.server.background_screen_busy():
+                        try:screen_off_if_idle(c)
+                        except Exception as exc:cleanup.append(str(exc))
             if not self.server.connected and phase=='completed':phase='connection_lost';error='Connection lost during cleanup; final state is uncertain.'
             elif cleanup and phase=='completed':phase='failed';error='Run completed but cleanup failed.'
             with self.guard:
@@ -392,13 +383,30 @@ class RunCoordinator:
                 self.server.event({'type':'run.finished','run_id':run['run_id'],'phase':phase,'error':error,'cleanup_errors':cleanup})
 
 
+_MISSING=object()
+
+
 class AgentServer:
     def __init__(self,options,client=None):
         self.options=options;self.root=options.state.parent/'server';self.root.mkdir(mode=0o700,parents=True,exist_ok=True)
         self.store=EventStore(self.root);self.screen_off_when_done=options.screen_off_when_done
-        self.connected=False;self.logs={};self.closing=threading.Event();self.rpc_guard=threading.RLock();self.control_queue=queue.Queue(maxsize=8);self.connection_error=None;self.reconnect_disabled=False;self.native_seen=set();self.native_order=[];self.dropped_counts={}
+        self.connected=False;self.logs={};self.log_native={};self.closing=threading.Event();self.rpc_guard=threading.RLock();self.control_queue=queue.Queue(maxsize=8);self.connection_error=None;self.reconnect_disabled=False;self.native_seen=set();self.native_order=[];self.dropped_counts={}
         self.saving_dumps=set()
-        self.client=client or ServerClient(private_json(options.credentials),options.state,timeout=20,retry_disconnect=False,manage_screen=False,screen_off_when_done=False,host=options.vita_ip,agent_name=options.agent_name,event_sink=self.receive,disconnect_sink=self.disconnected)
+        # Session features advertised by the plugin's subscribe reply.
+        self.features={};self.subscribed_token=None;self.lost_at=None;self.perf=None;self.reconnects=0
+        self._subscribing=False;self._rearming=False;self.renewer=None
+        # Serializes subscription without the server-wide RPC guard, which a
+        # long command may hold while a run thread needs its pushes back.
+        self._subscribe_lock=threading.RLock()
+        if client is None:
+            client=ServerClient(private_json(options.credentials),options.state,timeout=20,manage_screen=False,screen_off_when_done=False,host=options.vita_ip,agent_name=options.agent_name,event_sink=self.receive,disconnect_sink=self.disconnected,call_sink=self.after_call)
+            client.credentials_path=options.credentials
+            if getattr(options,'device_dir',None):
+                from renewal import SessionRenewer
+                self.renewer=SessionRenewer(options.device_dir,host=getattr(options,'vita_ip',None),agent_name=getattr(options,'agent_name',None),credentials_path=options.credentials,state_path=options.state)
+                client.session_hook=self.renewer
+            client.notice=self.notice
+        self.client=client
         seen_path=self.root/'native-events.json'
         if seen_path.exists():
             self.native_order=[tuple(item) for item in private_json(seen_path)];self.native_seen=set(self.native_order)
@@ -411,8 +419,24 @@ class AgentServer:
         elif event.get('type')=='coredump.complete':
             self.saving_dumps.discard(path)
         result=self.store.append(event);self.runs.on_event(result);return result
+    def notice(self,notice):
+        # Recovered/unresolved commands and renewals belong in the history.
+        self.event(dict(notice))
     def background_screen_busy(self):
         return bool(self.logs or self.saving_dumps)
+    def register_watch(self,native,path,marker,*,once=False,run_id=None):
+        """Watch IDs stay stable for callers even when re-armed under a new session."""
+        public=native
+        while public in self.logs:public=max(self.logs)+1
+        watch={'path':path,'marker':marker,'once':once,'native_id':native}
+        if run_id is not None:watch['run_id']=run_id
+        self.logs[public]=watch;self.log_native[native]=public
+        return public
+    def unregister_watch(self,public):
+        watch=self.logs.pop(public,None)
+        native=watch.get('native_id',public) if watch else public
+        self.log_native.pop(native,None)
+        return native
     def receive(self,frame):
         self.last_activity=time.monotonic()
         kind,result=frame['type'],frame['result'];run=frame.get('run_id')
@@ -433,134 +457,233 @@ class AgentServer:
             if result.get('dropped_samples'):self.event({'type':'performance.overflow','run_id':run,'lost':result['dropped_samples']})
             for sample in result['samples']:self.event({'type':'performance.sample','run_id':run,'sample':sample})
         elif kind=='log.batch':
-            watch=self.logs.get(result['watch_id'])
+            public=self.log_native.get(result['watch_id'],result['watch_id'])
+            watch=self.logs.get(public)
             if watch is None:return
-            meta={'watch_id':result['watch_id'],'path':watch.get('path'),'run_id':watch.get('run_id',run)}
+            watch['next_offset']=result['next_offset']
+            meta={'watch_id':public,'path':watch.get('path'),'run_id':watch.get('run_id',run)}
             if result['reset']:self.event({'type':'log.reset',**meta,'offset':result['offset']})
             if result['data']:self.event({'type':'log.data',**meta,'offset':result['offset'],'next_offset':result['next_offset'],'encoding':result['encoding'],'data':result['data']})
             if int(result['marker_hits']) and not watch.get('fired'):
                 self.event({'type':'log.marker',**meta,'literal':watch.get('marker'),'hits':result['marker_hits'],'ends':result['marker_ends'],'offsets_omitted':result['marker_offsets_omitted']})
                 if watch.get('once'):
-                    watch['fired']=True;self.control_queue.put_nowait(result['watch_id'])
+                    watch['fired']=True
+                    with contextlib.suppress(queue.Full):self.control_queue.put_nowait(public)
         else:raise ClientError('Unknown Vita push frame type.')
     def disconnected(self,message):
+        lost=getattr(self.client,'connection_lost',None)
+        if lost is not None:lost()
         if self.connected:
-            self.connected=False;self.connection_error=message;self.event({'type':'connection.lost','message':message})
-    def connect(self):
-        with self.rpc_guard:
-            reply=self.client.call('events.subscribe')
+            self.connected=False;self.connection_error=message;self.lost_at=time.monotonic()
+            self.event({'type':'connection.lost','message':message})
+    def _transport_live(self):
+        connection=getattr(self.client,'_connection',_MISSING)
+        return connection is _MISSING or (connection is not None and getattr(connection,'sock',None) is not None)
+    def _grace_covers(self,gap):
+        try:grace=int(self.features.get('connection_grace_us'))/1e6
+        except (TypeError,ValueError):return False
+        return gap is None or gap<grace-15
+    def subscribe(self):
+        """Enable native pushes for the current session (also the old-plugin reconnect)."""
+        with self._subscribe_lock:
+            previous=self.subscribed_token
+            gap=None if self.lost_at is None else time.monotonic()-self.lost_at
+            self._subscribing=True
+            try:reply=self.client.call('events.subscribe')
+            finally:self._subscribing=False
             if reply.get('status')=='error':
-                self.reconnect_disabled=True
                 raise ClientError('Installed plugin rejected native push subscription; install the matching build. '+str(reply.get('error')))
-            checked(reply);self.connected=True;self.connection_error=None;self.last_activity=time.monotonic()
-            self.event({'type':'connection.ready','transport':'persistent_tls_push','tty':reply.get('result',{}).get('tty')})
+            result=checked(reply)
+            session=result.get('session') if isinstance(result,dict) else None
+            self.features=dict(session) if isinstance(session,dict) else {}
+            self.subscribed_token=getattr(self.client,'token',None)
+            renewed=previous is not None and previous!=self.subscribed_token
+            self.connected=True;self.connection_error=None;self.last_activity=time.monotonic();self.lost_at=None
+            if previous is not None:self.reconnects+=1
+            self.event({'type':'connection.ready','transport':'persistent_tls_push','tty':result.get('tty') if isinstance(result,dict) else None,
+                        'resumed':previous is not None,'session_renewed':renewed})
+            if previous is not None and (renewed or not self._grace_covers(gap)):
+                self.rearm('session renewed' if renewed else 'reconnected after the native session grace')
+    def after_call(self):
+        """A command just succeeded: restore pushes if the connection changed."""
+        if self._subscribing or self._rearming or self.closing.is_set():return
+        self.last_activity=time.monotonic()
+        try:
+            if getattr(self.client,'token',None)!=self.subscribed_token:
+                self.subscribe()
+            elif not self.connected and self._transport_live():
+                if not self.features.get('ping'):
+                    # Older plugins drop push state with the connection.
+                    self.subscribe();return
+                gap=None if self.lost_at is None else time.monotonic()-self.lost_at
+                self.connected=True;self.connection_error=None;self.lost_at=None;self.reconnects+=1
+                self.event({'type':'connection.ready','transport':'persistent_tls_push','resumed':True,'session_renewed':False,
+                            'gap_s':None if gap is None else round(gap,3)})
+                if not self._grace_covers(gap):self.rearm('reconnected after the native session grace')
+        except ClientError as exc:
+            self.connection_error=str(exc)
+    def rearm(self,reason):
+        """Restart log watches and server-started performance pushes the Vita released."""
+        if self._rearming:return
+        same_session=reason!='session renewed'
+        self._rearming=True
+        try:
+            for public,watch in list(self.logs.items()):
+                old=watch.get('native_id',public)
+                if same_session:
+                    # IDs from an earlier session may name a new watch now.
+                    with contextlib.suppress(ClientError):self.client.call('log.stop',{'watch_id':old})
+                try:reply=self.client.call('log.start',{'path':watch['path'],'marker':watch['marker']})
+                except ClientError as exc:reply={'status':'client_error','error':str(exc)}
+                if reply.get('status')=='ok':
+                    native=reply['result']['watch_id']
+                    self.log_native.pop(old,None);self.log_native[native]=public;watch['native_id']=native
+                    self.event({'type':'log.resumed','watch_id':public,'path':watch['path'],'run_id':watch.get('run_id'),'reason':reason,
+                                'from_offset':reply['result'].get('offset'),'last_offset':watch.get('next_offset')})
+                else:
+                    self.unregister_watch(public)
+                    self.event({'type':'log.interrupted','watch_id':public,'reason':reason+'; re-arming failed: '+json.dumps(reply.get('error'))})
+            perf=self.perf
+            if perf:
+                remaining=perf['duration_s']-(time.monotonic()-perf['started'])
+                if remaining>=1:
+                    try:reply=self.client.call('performance.watch',{'duration_s':math.ceil(remaining),'interval_ms':perf['interval_ms']})
+                    except ClientError as exc:reply={'status':'client_error','error':str(exc)}
+                    resumed=reply.get('status') in ('ok','accepted')
+                    self.event({'type':'performance.resumed' if resumed else 'performance.interrupted','reason':reason,'remaining_s':math.ceil(remaining)})
+                    if not resumed:self.perf=None
+                else:self.perf=None
+        finally:self._rearming=False
+    def ensure_connected(self):
+        with self._subscribe_lock:
+            token=getattr(self.client,'token',None)
+            if self.connected and token==self.subscribed_token and self._transport_live():return
+            if token!=self.subscribed_token or not self.features.get('ping'):
+                self.subscribe();return
+            self.client.call('session.ping')
+            if not self.connected:self.subscribe()
     def _pending(self):
-        return private_json(self.options.state).get('pending') if self.options.state.exists() else None
+        try:return private_json(self.options.state).get('pending') if self.options.state.exists() else None
+        except (OSError,ValueError,ClientError):return None
 
     def _session_status(self):
         expires=getattr(self.client,'session_expires_at',None)
         deadline=getattr(self.client,'session_deadline',None)
         remaining=None if expires is None else max(0,deadline-time.monotonic() if deadline is not None else expires-time.time())
-        idle_remaining=max(0,30*60-(time.monotonic()-self.last_activity))
+        active=max(self.last_activity,getattr(self.client,'last_exchange',0) or 0)
+        idle_remaining=max(0,30*60-(time.monotonic()-active))
         expired=remaining==0 or idle_remaining==0
         return {'expires_at':expires,'expires_in_s':remaining,'idle_expires_in_s':idle_remaining,
-                'state':'expired' if expired else ('unknown' if expires is None else 'valid')}
+                'state':'expired' if expired else ('unknown' if expires is None else 'valid'),
+                'extend_supported':bool(self.features.get('extend')) and not getattr(self.client,'_extend_unsupported',False)}
 
-    def _renew_due(self):
-        session=self._session_status()
-        return (session['state']=='expired' or
-                (session['expires_in_s'] is not None and session['expires_in_s']<=60) or
-                time.monotonic()-self.last_activity>=29*60 or
-                (session['state']=='unknown' and isinstance(self.client,VitaClient) and getattr(self.options,'device_dir',None)))
-
-    def _new_session(self):
-        if self.reconnect_disabled or not getattr(self.options,'device_dir',None):
-            raise ClientError('Session renewal requires device_dir with its saved pairing identity.')
-        pending=self._pending()
-        if pending and pending.get('op') not in RETRYABLE_OPS:
-            raise ClientError('Uncertain pending command requires session recover.')
-        # Close the command channel first: the Vita only exposes the saved-peer
-        # listener after relinquishing the previous command connection.
-        self.connected=False;self.client.close()
-        # Give the native worker time to release the session listener.
-        time.sleep(1)
-        import pair_vita
-        pair_vita.BASE=self.options.device_dir.resolve()
-        with contextlib.redirect_stdout(__import__('sys').stderr):
-            creds=pair_vita.pair(resume=True,host=getattr(self.options,'vita_ip',None),agent_name=getattr(self.options,'agent_name',None),timeout=5)
-        # pair() archives the old state unchanged; effects are gated above.
-        self.client=ServerClient(creds,self.options.state,timeout=20,retry_disconnect=False,manage_screen=False,screen_off_when_done=False,event_sink=self.receive,disconnect_sink=self.disconnected)
-        self.client.command_ready_until=time.monotonic()+15
-        for watch_id in self.logs:
-            self.event({'type':'log.interrupted','watch_id':watch_id,'reason':'session renewed; re-register this listener'})
-        self.logs.clear();self.connect()
-        self.event({'type':'session.renewed'})
-
-    def _reconnect(self):
-        pending=self._pending()
-        if pending and pending.get('op') not in RETRYABLE_OPS:
-            raise ClientError('Uncertain pending command requires session recover.')
-        try:
-            if pending:self.client.recover()
-            self.connect()
-        except Exception:
-            self._new_session()
+    def _keep_alive(self):
+        """One supervisor tick: reconnect, extend before expiry, or heartbeat."""
+        client=self.client
+        while self.connected:
+            try:public=self.control_queue.get_nowait()
+            except queue.Empty:break
+            native=self.unregister_watch(public)
+            checked(client.call('log.stop',{'watch_id':native}))
+        if not self.connected or getattr(client,'token',None)!=self.subscribed_token:
+            self.ensure_connected();return
+        expired=getattr(client,'session_expired',None)
+        if expired is not None and expired(EXTEND_MARGIN_S):
+            if not getattr(client,'_extend_unsupported',True) and client.extend_session():return
+            if expired(120) and self.renewer is not None and not self.runs.busy():
+                # Older plugins cannot extend: renew while idle, not mid-command.
+                self.renewer.renew_now(client);self.ensure_connected();return
+        if self.features.get('ping') and time.monotonic()-(getattr(client,'last_exchange',0) or 0)>=HEARTBEAT_S:
+            client.call('session.ping')
 
     def _supervise(self):
-        backoff=2
-        while not self.closing.wait(backoff):
-            if self.reconnect_disabled:continue
+        failures=0;next_attempt=0
+        while not self.closing.wait(1):
+            if time.monotonic()<next_attempt:continue
+            # A running command does its own recovery; never queue behind it.
+            if not self.rpc_guard.acquire(timeout=.5):continue
             try:
-                with self.rpc_guard:
-                    # Do not interrupt a run, including dump finalization, to
-                    # renew authentication. Expiry is still visible in status.
-                    if self.runs.busy():continue
-                    if self.connected and self._renew_due():
-                        self._new_session()
-                    while self.connected:
-                        try:watch_id=self.control_queue.get_nowait()
-                        except queue.Empty:break
-                        checked(self.client.call('log.stop',{'watch_id':watch_id}));self.logs.pop(watch_id,None)
-                        self.last_activity=time.monotonic()
-                    if not self.connected:self._reconnect()
-                    backoff=2
-            except Exception as exc:self.connection_error=str(exc);backoff=min(60,backoff*2)
+                with recovery_limit(self.client,10):self._keep_alive()
+                failures=0
+            except Exception as exc:
+                self.connection_error=str(exc);failures+=1
+                next_attempt=time.monotonic()+min(15,2**failures)
+            finally:self.rpc_guard.release()
 
-    def dispatch(self,request,progress=None):
+    def renew_session(self,pair=False,log=None):
+        """session connect/pair while serving: reuse a live session when possible."""
+        client=self.client
+        before=getattr(client,'token',None)
+        if not pair:
+            try:
+                with recovery_limit(client,5):
+                    reply=client.call('session.ping' if self.features.get('ping') else 'capabilities')
+                if reply.get('status')=='ok':
+                    self.ensure_connected()
+                    return {'status':'ok','result':{'session':'reused' if getattr(client,'token',None)==before else 'renewed','session_status':self._session_status()}}
+            except ClientError:
+                pass
+        if self.renewer is None:raise ClientError('Session renewal requires device_dir with its saved pairing identity.')
+        self.renewer.renew_now(client,pair=pair,log=log)
+        self.ensure_connected()
+        return {'status':'ok','result':{'session':'paired' if pair else 'renewed','session_status':self._session_status()}}
+
+    def dispatch(self,request,progress=None,cancel=None):
         method=request.get('method');args=request.get('args',{})
         if not isinstance(args,dict):raise ClientError('Server arguments must be an object.')
-        if method=='server.status':return {'status':'ok','result':{'connected':self.connected and self._session_status()['state']!='expired','session':self._session_status(),'connection_error':self.connection_error,'run':self.runs.status(),'latest_event':self.store.sequence,'socket':str(self.socket_path),'event_journal':str(self.store.path)}}
+        if method=='server.status':
+            session=self._session_status()
+            result={'connected':self.connected and session['state']!='expired','session':session,'connection_error':self.connection_error,'run':self.runs.status(),'latest_event':self.store.sequence,'socket':str(self.socket_path),'event_journal':str(self.store.path),
+                    'features':self.features,'reconnects':self.reconnects}
+            unresolved=read_unresolved(self.options.state,5)
+            if unresolved:
+                result['unresolved']=unresolved;result['unresolved_journal']=str(unresolved_path(self.options.state))
+            return {'status':'ok','result':result}
         if method=='events.read':return {'status':'ok','result':self.store.read(**args)}
+        if method=='session.renew':
+            if self.runs.busy():raise ClientError('A run is active; session changes wait until it finishes (run status, run cancel).')
+            def log(*parts):
+                if progress is not None:progress({'status':'output','value':{'message':' '.join(str(p) for p in parts)}})
+            with self.rpc_guard:return self.renew_session(bool(args.get('pair')),log)
         recovery=method=='execute' and args.get('group')=='session' and args.get('action')=='recover'
         if recovery:
             if self.runs.busy():raise ClientError('Session recovery conflicts with the active run.')
-            # Recover the exact pending request before screen.on, subscription
-            # or renewal can try to issue another command or replace its grant.
+            # Recover the exact pending request before screen.on can issue another.
             with self.rpc_guard:return self.client.recover()
-        if method not in ('run.status','run.cancel'):
+        if method=='run.start':
             with self.rpc_guard:
                 if not self.runs.busy():
-                    if not self.connected:self._reconnect()
-                    elif self._renew_due():self._new_session()
-        if method=='run.start':return {'status':'ok','result':self.runs.start(args)}
+                    try:self.ensure_connected()
+                    except ClientError as exc:raise ClientError('Vita event connection is unavailable: '+str(exc)) from exc
+            return {'status':'ok','result':self.runs.start(args)}
         if method=='run.status':return {'status':'ok','result':self.runs.status()}
         if method=='run.cancel':return {'status':'ok','result':self.runs.cancel()}
         if method=='performance.start':
             if self.runs.busy():raise ClientError('Performance is controlled by the active run.')
             VitaClient._command('performance.watch',args)
-            with self.rpc_guard:return self.client.call('performance.watch',args)
+            with self.rpc_guard:
+                reply=self.client.call('performance.watch',args)
+                if reply.get('status') in ('ok','accepted'):self.perf={'duration_s':args['duration_s'],'interval_ms':args['interval_ms'],'started':time.monotonic()}
+                return reply
         if method=='performance.stop':
             if self.runs.busy():raise ClientError('Performance is controlled by the active run.')
-            with self.rpc_guard:return self.client.call('performance.cancel')
+            with self.rpc_guard:
+                self.perf=None
+                return self.client.call('performance.cancel')
         if method=='watch.log.start':
             if set(args)-{'path','literal','once'} or not {'path','literal'}<=set(args) or type(args.get('once',False))is not bool:raise ClientError('Log watch requires path/literal and optional once.')
             with self.rpc_guard:
                 result=checked(self.client.call('log.start',{'path':args['path'],'marker':args['literal']}))
-                self.logs[result['watch_id']]={'path':args['path'],'marker':args['literal'],'once':args.get('once',False)}
-                return {'status':'ok','result':result}
+                public=self.register_watch(result['watch_id'],args['path'],args['literal'],once=args.get('once',False))
+                return {'status':'ok','result':{**result,'watch_id':public}}
         if method=='watch.log.stop':
             with self.rpc_guard:
-                reply=self.client.call('log.stop',args);checked(reply);self.logs.pop(args['watch_id'],None);return reply
+                watch_id=args.get('watch_id')
+                native=self.logs.get(watch_id,{}).get('native_id',watch_id)
+                reply=self.client.call('log.stop',{**args,'watch_id':native});checked(reply);self.unregister_watch(watch_id)
+                if isinstance(reply.get('result'),dict) and 'watch_id' in reply['result']:
+                    reply={**reply,'result':{**reply['result'],'watch_id':watch_id}}
+                return reply
         if method=='execute':
             import argparse
             import vita_agent
@@ -568,38 +691,38 @@ class AgentServer:
             for field in ('source','file','output','transfer_state','candidate','plan','macro_store','state','credentials','device_dir'):
                 if values.get(field) is not None:values[field]=Path(values[field])
             options=argparse.Namespace(**values)
+            options._cancel=cancel
             if self.runs.busy() and (options.group in ('app','input','touch','macro','config','content','decrypt') or (options.group=='screen' and options.action!='capture') or (options.group=='fs' and options.action not in ('list','stat','download')) or options.group in ('call','session','performance')):raise ClientError('This command conflicts with the active run; status, events, metadata and captures remain available.')
             with self.rpc_guard:
-                # Only repeat complete CLI operations that are observations;
-                # other commands retain exact-ID recovery even on disconnect.
-                observation=(options.group=='system' and options.action=='snapshot') or (options.group=='fs' and options.action in ('list','stat')) or (options.group=='app' and options.action in ('list','running'))
+                client=self.client
+                if isinstance(getattr(client,'notices',None),list):client.notices=[]
                 def command_progress(event):
                     self.event({'type':'command.progress','result':event})
-                    if progress is not None and event.get('status')=='progress':progress(event)
-                def execute():
-                    if options.group!='screen' or options.action not in ('on','off'):checked(self.client.call('screen.on'))
-                    client=UploadClient(self) if options.group=='fs' and options.action=='upload' else self.client
-                    result=vita_agent.execute(options,client,emit_result=command_progress)
-                    self.last_activity=time.monotonic()
-                    return result
+                    if progress is None:return
+                    if isinstance(event,dict) and event.get('status')=='progress':progress(event)
+                    else:progress({'status':'output','value':event})
+                if options.group!='screen' or options.action not in ('on','off'):
+                    # Best effort: a display that will not wake must not block the command.
+                    with contextlib.suppress(ClientError):client.call('screen.on')
+                failed=True;result=None
                 try:
-                    try:return execute()
-                    except (OSError,ClientError):
-                        pending=self._pending()
-                        if not observation or not pending or pending.get('op') not in RETRYABLE_OPS or self.runs.busy():raise
-                        self._new_session()
-                        return execute()
+                    result=vita_agent.execute(options,client,emit_result=command_progress)
+                    failed=False
                 finally:
-                    failed=sys.exc_info()[0] is not None
+                    self.last_activity=time.monotonic()
                     # Preserve the primary failure and any pending request;
                     # local validation errors still get normal screen cleanup.
                     cleanup=self.screen_off_when_done and not self.runs.busy() and not self.background_screen_busy() and getattr(options,'op',None)!='system.reboot' and not (options.group=='screen' and options.action in ('on','off'))
-                    if cleanup and (not failed or (self.connected and self._pending() is None)):
+                    if cleanup and (not failed or self._pending() is None):
                         try:
-                            screen_off_if_idle(self.client);self.last_activity=time.monotonic()
+                            with recovery_limit(client,10):screen_off_if_idle(client)
                         except Exception as exc:
-                            if not failed:raise
+                            # Cleanup never replaces the command's own result.
                             self.event({'type':'command.cleanup_failed','message':str(exc)})
+                            if not failed and isinstance(result,dict):result['cleanup_error']=str(exc)
+                notices=getattr(client,'notices',None)
+                if notices and isinstance(result,dict):result['notices']=list(notices)
+                return result
         raise ClientError('Unknown server method.')
     @property
     def socket_path(self):return self.root/'server.sock'
@@ -607,31 +730,59 @@ class AgentServer:
         path=self.socket_path
         lock=os.open(self.root/'server.lock',os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
         import fcntl
-        try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-        except BlockingIOError:os.close(lock);raise ClientError('PC server is already running.') from None
+        # A CLI may hold a shared probe lock for an instant.
+        deadline=time.monotonic()+2
+        while True:
+            try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB);break
+            except BlockingIOError:
+                if time.monotonic()>=deadline:
+                    os.close(lock)
+                    # One server per identity owns the Vita's single command
+                    # connection; a second one just points at it.
+                    print(json.dumps(already_serving(self.options)),flush=True);return
+                time.sleep(.05)
+        with contextlib.suppress(OSError):
+            os.ftruncate(lock,0);os.pwrite(lock,(str(os.getpid())+'\n').encode(),0)
         server=self
         class Handler(socketserver.StreamRequestHandler):
             def handle(self):
                 self.request.settimeout(IPC_IDLE_TIMEOUT)
+                guard=threading.Lock();cancel=threading.Event();done=threading.Event()
                 def send(result):
                     encoded=json.dumps(result,ensure_ascii=False,separators=(',',':')).encode()+b'\n'
                     if len(encoded)>MAX_IPC:encoded=b'{"status":"client_error","message":"IPC reply exceeds 1 MiB; request a limit."}\n'
-                    with contextlib.suppress(OSError):
-                        self.wfile.write(encoded);self.wfile.flush()
+                    with guard:
+                        try:
+                            self.wfile.write(encoded);self.wfile.flush()
+                        except OSError:
+                            # The CLI went away: let loops waiting on it stop.
+                            cancel.set()
+                def keepalive():
+                    while not done.wait(IPC_KEEPALIVE):send({'status':'keepalive'})
                 try:
                     raw=self.rfile.readline(MAX_IPC+1)
                     if len(raw)>MAX_IPC or not raw.endswith(b'\n'):raise ClientError('IPC request exceeds limit or lacks framing.')
-                    result=server.dispatch(strict_json(raw),progress=send)
-                except (NativeFrameError,UploadError) as exc:result=exc.as_result()
+                    threading.Thread(target=keepalive,name='vita-ipc-keepalive',daemon=True).start()
+                    result=server.dispatch(strict_json(raw),progress=send,cancel=cancel)
+                except (NativeFrameError,UploadError,UncertainOutcomeError) as exc:result=exc.as_result()
                 except Exception as exc:result={'status':'client_error','message':str(exc)}
+                finally:done.set()
                 send(result)
         class Listener(socketserver.ThreadingUnixStreamServer):
             daemon_threads=True
         with contextlib.suppress(FileNotFoundError):path.unlink()
+        handlers={}
+        def stop(signum,frame):
+            for sig in handlers:signal.signal(sig,signal.SIG_IGN)
+            raise SystemExit(0)
+        if threading.current_thread() is threading.main_thread():
+            for sig in (signal.SIGTERM,signal.SIGHUP):
+                with contextlib.suppress(ValueError,OSError):handlers[sig]=signal.signal(sig,stop)
         try:
             with Listener(str(path),Handler) as listener:
                 os.chmod(path,0o600)
-                try:self.connect()
+                try:
+                    with recovery_limit(self.client,15):self.ensure_connected()
                 except Exception as exc:self.connection_error=str(exc)
                 supervisor=threading.Thread(target=self._supervise,name='vita-server-supervisor',daemon=True);supervisor.start()
                 print(json.dumps({'status':'ok','result':{'listening':str(path),'connected':self.connected,'transport':'persistent_tls_push'}}),flush=True)
@@ -641,13 +792,15 @@ class AgentServer:
             if self.runs.busy():
                 self.runs.cancel()
                 if self.runs.thread:self.runs.thread.join(timeout=25)
-            self.client.close()
+            with contextlib.suppress(Exception):self.client.close()
             if 'supervisor' in locals():supervisor.join(timeout=8)
             with contextlib.suppress(FileNotFoundError):path.unlink()
+            for sig,previous in handlers.items():
+                with contextlib.suppress(ValueError,OSError,TypeError):signal.signal(sig,previous)
             os.close(lock)
 
 
-def request(options,method,args=None,*,emit_progress=None):
+def request(options,method,args=None,*,emit_progress=None,emit_output=None):
     path=options.state.parent/'server/server.sock'
     payload=json.dumps({'method':method,'args':args or {}},default=lambda x:str(x) if isinstance(x,Path) else x,ensure_ascii=False,separators=(',',':')).encode()+b'\n'
     if len(payload)>MAX_IPC:raise ClientError('Server request exceeds 1 MiB.')
@@ -664,12 +817,20 @@ def request(options,method,args=None,*,emit_progress=None):
                     if len(raw)>MAX_IPC or not raw.endswith(b'\n'):raise ClientError('Incomplete or oversized PC server reply.')
                     reply=strict_json(raw)
                     if not isinstance(reply,dict):raise ClientError('Invalid PC server reply.')
-                    if reply.get('status')!='progress':return reply
+                    status=reply.get('status')
+                    if status=='keepalive':continue
+                    if status=='output':
+                        if emit_output is not None:emit_output(reply.get('value'))
+                        continue
+                    if status!='progress':return reply
                     latest=reply.get('result')
                     if not isinstance(latest,dict):raise ClientError('Invalid PC server progress.')
                     if emit_progress is not None:emit_progress(reply)
     except (TimeoutError,OSError,ClientError) as exc:
         detail=str(exc) or type(exc).__name__
+        if isinstance(exc,TimeoutError):
+            detail=('The PC server sent nothing for %d s, not even its keepalive; it may be stuck. Check server status '
+                    'or restart serve (credentials and pending state are kept).'%IPC_IDLE_TIMEOUT)
         if isinstance(exc,(ConnectionRefusedError,FileNotFoundError)):
             detail=('Local PC serve socket is unavailable; this does not show whether the Vita is reachable. '
                     'Check VITA_AGENT_CONFIG_DIR and start serve with the same config/identity directory. '
@@ -677,9 +838,31 @@ def request(options,method,args=None,*,emit_progress=None):
         if isinstance(latest,dict) and latest.get('type')=='upload':
             raise UploadError('PC server progress stopped: '+detail+
                               '; the server may still be transferring. Wait for it to finish before resuming',latest) from exc
-        if isinstance(exc,(ConnectionRefusedError,FileNotFoundError)):
+        if isinstance(exc,(ConnectionRefusedError,FileNotFoundError,TimeoutError)):
             raise ClientError(detail) from exc
         raise
 
 
-def running(options):return (options.state.parent/'server/server.sock').exists()
+def already_serving(options):
+    root=options.state.parent/'server'
+    pid=None
+    with contextlib.suppress(OSError,ValueError):
+        pid=int((root/'server.lock').read_text().strip() or 0) or None
+    return {'status':'ok','result':{'already_running':True,'pid':pid,'socket':str(root/'server.sock'),
+            'message':'A serve process already runs for this config directory; commands use it. '
+                      'Only one can own the Vita command connection, so nothing else was started.'}}
+
+
+def running(options):
+    """True only while a serve process holds the lock; a stale socket is ignored."""
+    root=options.state.parent/'server'
+    if not (root/'server.sock').exists():return False
+    try:fd=os.open(root/'server.lock',os.O_RDONLY|os.O_NOFOLLOW)
+    except FileNotFoundError:return True
+    except OSError:return True
+    try:
+        import fcntl
+        try:fcntl.flock(fd,fcntl.LOCK_SH|fcntl.LOCK_NB)
+        except BlockingIOError:return True
+        return False
+    finally:os.close(fd)

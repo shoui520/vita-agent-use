@@ -16,6 +16,7 @@ import math
 import os
 from pathlib import Path
 import re
+import socket
 import ssl
 import stat
 import struct
@@ -25,13 +26,169 @@ import threading
 import time
 from input_sequence import validate as validate_readable_events
 
+# A TCP connect plus TLS handshake may wait behind the Vita retiring a dead
+# connection (up to 30 s), so allow well beyond that before giving up.
+CONNECT_TIMEOUT = 60
+# Native work is synchronous on the Vita; keepalive notices a dead peer while
+# waiting, so a slow reply is waited for rather than abandoned.
+RESPONSE_TIMEOUT = 180
+# How long one call keeps reconnecting, renewing and replaying before it
+# reports failure.
+RECOVERY_WINDOW = 90
+LOCK_WAIT = 300
+# After a network reset the Vita reopens its command listener within about a
+# second, keeping the session; a refusal that soon after a drop is waited out
+# instead of being taken as a lost session.
+LISTENER_RESET_WAIT = 10
+# Running these again under a new session has no effect beyond the reply, so
+# a lost reply is simply asked for again instead of being recorded unresolved.
+REPEATABLE_OPS = frozenset({
+    'capabilities', 'system.snapshot', 'app.running', 'app.list', 'fs.stat', 'fs.list',
+    'plugins.list', 'touch.panels', 'livearea.schema', 'livearea.layout', 'livearea.blob',
+    'performance.read', 'events.read', 'dialog.events.read', 'log.read', 'input.status',
+    'input.heartbeat', 'run.status', 'acl.status', 'acl.audit', 'content.list', 'content.scope',
+    'content.albums', 'content.audit', 'content.delete.status', 'content.delete.changes',
+    'app.install.status', 'decrypt.status', 'screen.on', 'screen.off', 'events.subscribe',
+    'session.ping', 'session.extend'})
+# The Vita journals these by operation/request ID and answers a repeat with
+# the recorded outcome, so they may be resent even under a new session.
+DEDUPED_OPS = frozenset({'fs.mkdir', 'fs.move', 'fs.trash', 'fs.purge', 'app.install',
+                         'decrypt.start', 'acl.request', 'content.delete.request',
+                         'content.delete.preview'})
+# Their effect belongs to the session itself and ended with it.
+SESSION_BOUND_OPS = frozenset({
+    'log.start', 'log.stop', 'events.start', 'events.stop', 'dialog.events.start',
+    'dialog.events.stop', 'performance.measure', 'performance.watch', 'performance.cancel',
+    'run.begin', 'run.update', 'run.end', 'input.acquire', 'input.cancel', 'input.release',
+    'macro.acquire'})
+RESENDABLE_OPS = REPEATABLE_OPS | DEDUPED_OPS | SESSION_BOUND_OPS
+# Session upkeep: no screen wake, and never replaces the reply session recover shows.
+QUIET_OPS = frozenset({'session.ping', 'session.extend', 'events.subscribe'})
+
 
 class ClientError(Exception):
     pass
 
 
+class NotExecutedError(ClientError):
+    """The Vita certainly did not run this request; sending it again is safe."""
+    retryable = True
+
+
+class NotSentError(NotExecutedError):
+    """No complete request reached the Vita (connect, TLS or send failed)."""
+    def __init__(self, message, *, refused=False):
+        super().__init__(message)
+        self.refused = refused
+
+
+class PinMismatchError(NotSentError):
+    retryable = False
+
+
+class GrantExpiredError(NotExecutedError):
+    """The Vita rejected the token before running anything (HTTP 401)."""
+
+
+class ServiceBusyError(NotExecutedError):
+    """The Vita answered 503: its monitor was not ready, nothing ran."""
+
+
+class CommandRejected(NotExecutedError):
+    """The Vita refused the request before reserving its ID (id null)."""
+    def __init__(self, message, reply, *, retryable=False):
+        super().__init__(message)
+        self.reply, self.retryable = reply, retryable
+
+
+class UncertainError(ClientError):
+    """The request was sent but no complete reply arrived. The exact request
+    stays pending and is replayed with the same ID, which never repeats it."""
+
+
+class UncertainOutcomeError(ClientError):
+    """A sent request can no longer be replayed because the Vita lost the
+    session it ran under. It is recorded in unresolved.jsonl, never resent."""
+    def __init__(self, message, record):
+        super().__init__(message)
+        self.record = record
+
+    def as_result(self):
+        return {'status': 'unconfirmed', 'message': str(self), 'unresolved': self.record}
+
+
 class UploadTransportError(ClientError):
     """The same durable upload step may be retried after reconnecting."""
+
+
+def set_keepalive(sock):
+    """Notice a peer that vanished (sleep, Wi-Fi loss, NAT reset) in ~40 s."""
+    for level, name, value in ((socket.SOL_SOCKET, 'SO_KEEPALIVE', 1),
+                               (socket.IPPROTO_TCP, 'TCP_KEEPIDLE', 15),
+                               (socket.IPPROTO_TCP, 'TCP_KEEPALIVE', 15),
+                               (socket.IPPROTO_TCP, 'TCP_KEEPINTVL', 5),
+                               (socket.IPPROTO_TCP, 'TCP_KEEPCNT', 5),
+                               (socket.IPPROTO_TCP, 'TCP_USER_TIMEOUT', 60000)):
+        option = getattr(socket, name, None)
+        if option is None:
+            continue
+        try:
+            sock.setsockopt(level, option, value)
+        except OSError:
+            pass
+
+
+def unresolved_path(state_path):
+    return Path(state_path).parent / 'unresolved.jsonl'
+
+
+def record_unresolved(state_path, pending, reason):
+    """Append an unreplayable request to the private unresolved journal."""
+    op = pending.get('op')
+    if op in DEDUPED_OPS:
+        instruction = ('Outcome unknown. Repeating the identical command with the same operation/request ID is '
+                       'safe: the Vita answers a repeat with the recorded outcome instead of acting twice.')
+    elif op in SESSION_BOUND_OPS:
+        instruction = 'Its effect ended with the old session; issue it again if it is still needed.'
+    elif op == 'system.reboot':
+        instruction = ('The session ended after the reboot request, which a reboot does. Check with '
+                       'diagnostics status or system snapshot that the Vita restarted.')
+    else:
+        instruction = ('Outcome unknown: check the resulting Vita state (app running, fs stat/list, input/macro '
+                       'status, audit) before repeating this operation.')
+    record = {'recorded_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'reason': reason,
+              'id': pending.get('id'), 'op': op, 'args': pending.get('args'), 'instruction': instruction}
+    path = unresolved_path(state_path)
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'a', encoding='utf-8') as stream:
+        stream.write(json.dumps(record, ensure_ascii=False, separators=(',', ':')) + '\n')
+        stream.flush()
+        os.fsync(stream.fileno())
+    return record
+
+
+def archive_pending(state_path, pending, reason):
+    """Record a request whose reply can no longer be replayed; reads are dropped."""
+    if not isinstance(pending, dict) or pending.get('op') in REPEATABLE_OPS:
+        return None
+    return record_unresolved(state_path, pending, reason)
+
+
+def read_unresolved(state_path, limit=20):
+    path = unresolved_path(state_path)
+    if not path.exists():
+        return []
+    records = []
+    with path.open('rb') as stream:
+        stream.seek(0, 2)
+        end = stream.tell()
+        stream.seek(max(0, end - 262144))
+        for line in stream.read().splitlines():
+            try:
+                records.append(json.loads(line))
+            except ValueError:
+                continue
+    return records[-limit:]
 
 
 def upload_wait_timeout(request, action, timeout=20):
@@ -53,11 +210,19 @@ def connection_setup_hint():
             'Keep existing identity files, credentials and recovery state; do not regenerate or delete them.')
 
 
-def connection_refused_message():
-    return ('Vita connection was refused. '+connection_setup_hint()+' '
-            'It may still hold an active session from this PC after serve stopped. '
-            'Start serve to reuse the saved session, or wait for that session to expire. '
-            'Also check the Vita is awake, its IP is correct, and the plugin is running.')
+def connection_refused_message(port=None):
+    if port == 8847:
+        return ('Nothing is accepting connections on the Vita pairing port 8847. Check the Vita is awake and on '
+                'Wi-Fi, vita_ip in config.json is its current address, and the vita-agent-use plugin is loaded '
+                '(diagnostics status shows whether it is running). '+connection_setup_hint())
+    if port is None:
+        return ('Vita connection was refused. Check the Vita is awake, vita_ip is its current address and the plugin '
+                'is running. A session from this PC may still be active; session connect and serve reuse it. '
+                +connection_setup_hint())
+    return ('The Vita refused the command port: it has no live command session for this PC right now '
+            '(it rebooted, the session expired, or it is switching sessions). The client renews it '
+            'automatically from the saved pairing; if that keeps failing, check the Vita is awake and run '
+            'session connect. '+connection_setup_hint())
 
 
 def screen_off_if_idle(client):
@@ -114,6 +279,13 @@ def validate_host(host):
         raise ClientError('Invalid device host.')
 
 
+class FileReadRejected(ClientError):
+    """A complete, valid refusal (missing file, policy); retrying will not help."""
+    def __init__(self, message, status, code):
+        super().__init__(message)
+        self.status, self.code = status, code
+
+
 class NativeFrameError(ClientError):
     def __init__(self, status, code, stage=None, display=None, name=None, message=None):
         self.display = display
@@ -152,12 +324,21 @@ def strict_json(data):
                       parse_constant=lambda _: (_ for _ in ()).throw(ValueError('non-finite number')))
 
 
+def ensure_private(fd, path, kind='Credential/state file'):
+    """Owned regular files that are merely too permissive are tightened, not rejected."""
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+        raise ClientError(kind + ' must be a regular file owned by this user: ' + str(path))
+    if info.st_mode & 0o077:
+        os.fchmod(fd, stat.S_IMODE(info.st_mode) & 0o700)
+        print('vita-agent: tightened permissions of ' + str(path) + ' to owner-only.', file=sys.stderr)
+    return os.fstat(fd)
+
+
 def private_json(path, max_bytes=524288):
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     with os.fdopen(fd, 'rb') as stream:
-        info = os.fstat(stream.fileno())
-        if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077 or info.st_uid != os.getuid():
-            raise ClientError('Credential/state files must be owned by this user and private (mode 600).')
+        ensure_private(stream.fileno(), path)
         data = stream.read(max_bytes+1)
         if len(data) > max_bytes:
             raise ClientError('Credential/state file exceeds its 512 KiB size limit.')
@@ -168,9 +349,9 @@ def private_json(path, max_bytes=524288):
 def private_pem(path):
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     with os.fdopen(fd, 'rb') as stream:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077 or info.st_uid != os.getuid() or not 0 < info.st_size <= 16384:
-            raise ClientError('TLS identity files must be private, user-owned regular files of at most 16 KiB.')
+        info = ensure_private(fd, path, 'TLS identity file')
+        if not 0 < info.st_size <= 16384:
+            raise ClientError('TLS identity files must be at most 16 KiB: ' + str(path))
         # Load from the validated open descriptor, avoiding a path replacement
         # between checking permissions and OpenSSL reading the private key.
         yield '/dev/fd/' + str(fd)
@@ -200,79 +381,211 @@ def durable_json(path, value, *, max_bytes=524288):
 class VitaClient:
     def __init__(self, credentials, state_path, timeout=10, retry_disconnect=True, manage_screen=True, screen_off_when_done=True, host=None, agent_name=None):
         self._request_guard = threading.RLock()
+        self._lock_depth = 0
+        self._lock_fd = None
         self.manage_screen = manage_screen
         if type(screen_off_when_done) is not bool:
             raise ClientError("screen_off_when_done must be a boolean.")
         self.screen_off_when_done = screen_off_when_done
         self._screen_owned = False
+        self._screen_tried = False
         self._screen_cleanup_error = None
         self.retry_disconnect = retry_disconnect
+        self._recovery_window = None
+        # Optional callable(client, exc) that renews the session or reconnects.
+        self.session_hook = None
+        # Optional callable(dict) receiving recovered/unresolved notices.
+        self.notice = None
+        self.notices = []
+        self._recovering = False
+        self._host_override = host
+        self._agent_name_override = agent_name
+        if not 0 < timeout <= 60:
+            raise ClientError('Timeout must be between zero and 60 seconds.')
+        self.timeout = timeout
+        self.response_timeout = max(timeout, RESPONSE_TIMEOUT) if retry_disconnect else timeout
+        self._connection = None
+        self._upload_chunk_bytes = None
+        self.path = Path(state_path)
+        # Optional saved credentials file, re-read if another process renews.
+        self.credentials_path = None
+        # Monotonic time until which a refused command port is waited for.
+        self.command_ready_until = 0
+        self.last_recovery_error = None
+        self._extend_unsupported = False
+        # Monotonic time of the last complete reply (the server's heartbeat clock).
+        self.last_exchange = 0
+        self._local = threading.local()
+        self._load_credentials(credentials)
+
+    @property
+    def recovery_window(self):
+        """Seconds one call keeps reconnecting/replaying; 0 makes one attempt."""
+        if self._recovery_window is not None:
+            return self._recovery_window
+        return RECOVERY_WINDOW if self.retry_disconnect else 0
+
+    @recovery_window.setter
+    def recovery_window(self, seconds):
+        self._recovery_window = seconds
+
+    def _load_credentials(self, credentials):
         required = {'host', 'port', 'token', 'certificate_sha256', 'client_certificate', 'client_key'}
         if not required <= set(credentials) or set(credentials) - (required | {'agent_name', 'session_expires_at'}):
             raise ClientError('Invalid credential fields.')
         for field in ('client_certificate', 'client_key'):
             if not isinstance(credentials[field], str) or not Path(credentials[field]).is_absolute():
                 raise ClientError('TLS identity file paths must be absolute.')
-        self.client_certificate = credentials['client_certificate']
-        self.client_key = credentials['client_key']
-        self.agent_name = credentials.get('agent_name', 'Agent') if agent_name is None else agent_name
-        validate_agent_name(self.agent_name)
-        self.host = credentials['host'] if host is None else host
-        self.port = credentials['port']
-        self.token = credentials['token']
-        self.pin = credentials['certificate_sha256']
-        validate_host(self.host)
-        if type(self.port) is not int or not 1 <= self.port <= 65535:
+        agent_name = credentials.get('agent_name', 'Agent') if self._agent_name_override is None else self._agent_name_override
+        validate_agent_name(agent_name)
+        host = credentials['host'] if self._host_override is None else self._host_override
+        validate_host(host)
+        port = credentials['port']
+        if type(port) is not int or not 1 <= port <= 65535:
             raise ClientError('Invalid device port.')
         if any(not isinstance(v, str) or not re.fullmatch('[0-9a-f]{64}', v)
-               for v in (self.token, self.pin)):
+               for v in (credentials['token'], credentials['certificate_sha256'])):
             raise ClientError('Invalid pairing token or certificate fingerprint.')
-        if not 0 < timeout <= 60:
-            raise ClientError('Timeout must be between zero and 60 seconds.')
-        self.session_expires_at = credentials.get('session_expires_at')
-        if self.session_expires_at is not None and (type(self.session_expires_at) not in (int,float) or not math.isfinite(self.session_expires_at) or self.session_expires_at <= 0):
+        expires = credentials.get('session_expires_at')
+        if expires is not None and (type(expires) not in (int,float) or not math.isfinite(expires) or expires <= 0):
             raise ClientError('Invalid session expiry timestamp.')
-        self.session_deadline = None if self.session_expires_at is None else time.monotonic()+max(0,self.session_expires_at-time.time())
-        self.timeout = timeout
-        self._connection = None
-        self._upload_chunk_bytes = None
-        self.path = Path(state_path)
+        self._credentials = dict(credentials)
+        self.client_certificate = credentials['client_certificate']
+        self.client_key = credentials['client_key']
+        self.agent_name, self.host, self.port = agent_name, host, port
+        self.token = credentials['token']
+        self.pin = credentials['certificate_sha256']
+        self.session_expires_at = expires
+        self.session_deadline = None if expires is None else time.monotonic()+max(0,expires-time.time())
         self.identity = hashlib.sha256(json.dumps({k: v for k, v in credentials.items() if k not in ('agent_name', 'session_expires_at')}, sort_keys=True).encode()).hexdigest()
+
+    def rebind(self, credentials):
+        """Adopt renewed credentials in place; callers keep this same client."""
+        with self._request_guard:
+            self._close_transport()
+            self._load_credentials(credentials)
+
+    def extend_expiry(self, lifetime_s, started_at):
+        self.session_expires_at = started_at + lifetime_s
+        self.session_deadline = time.monotonic() + max(0, self.session_expires_at - time.time())
+        self._credentials['session_expires_at'] = self.session_expires_at
+        if self.credentials_path is not None:
+            try:
+                saved = private_json(self.credentials_path)
+                if saved.get('token') == self.token:
+                    saved['session_expires_at'] = self.session_expires_at
+                    durable_json(Path(self.credentials_path), saved)
+            except (OSError, ValueError, ClientError):
+                pass
+
+    def extend_session(self):
+        """Keep the same token, replay cache and watches for another full lifetime."""
+        if self._extend_unsupported:
+            return False
+        started = time.time()
+        reply = self._call_raw('session.extend', {})
+        result = reply.get('result') if reply.get('status') == 'ok' else None
+        lifetime = result.get('lifetime_us') if isinstance(result, dict) else None
+        if not isinstance(lifetime, str) or not re.fullmatch('[1-9][0-9]{0,12}', lifetime):
+            # Older plugins: sessions are renewed through the saved pairing instead.
+            self._extend_unsupported = True
+            return False
+        self.extend_expiry(int(lifetime) / 1e6, started)
+        return True
+
+    def session_expired(self, margin=0):
+        return self.session_deadline is not None and time.monotonic() >= self.session_deadline - margin
+
+    @contextmanager
+    def recovery_limit(self, seconds):
+        """Shorten this thread's recovery window (cleanup, heartbeats)."""
+        previous = getattr(self._local, 'window', None)
+        self._local.window = min(self._window(), seconds)
+        try:
+            yield
+        finally:
+            self._local.window = previous
+
+    def _window(self):
+        override = getattr(self._local, 'window', None)
+        return self.recovery_window if override is None else override
+
+    def _emit_notice(self, notice):
+        self.notices.append(notice)
+        if self.notice is not None:
+            try:
+                self.notice(notice)
+            except Exception:
+                pass
 
     @contextmanager
     def _locked_state(self):
-        # Threads in this harness share one connection; other processes still fail fast.
+        with self._state_lock():
+            yield self._load_state()
+
+    @contextmanager
+    def _state_lock(self):
+        # Threads in this harness share one connection; other processes wait
+        # their turn instead of failing, since commands are short.
         with self._request_guard:
+            if self._lock_depth:
+                # Same thread already owns the cross-process lock.
+                self._lock_depth += 1
+                try:
+                    yield
+                finally:
+                    self._lock_depth -= 1
+                return
             # Separate lock inode survives replacement of the durable state file.
             fd = os.open(str(self.path) + '.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
             try:
-                info = os.fstat(fd)
-                if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077 or info.st_uid != os.getuid():
-                    raise ClientError('State lock must be a private regular file.')
+                ensure_private(fd, str(self.path) + '.lock', 'State lock')
+                deadline = time.monotonic() + LOCK_WAIT
+                while True:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() >= deadline:
+                            raise ClientError('Another vita-agent process has held this session for %d s; '
+                                              'it is still running a command. Wait for it or stop it.' % LOCK_WAIT) from None
+                        time.sleep(0.05)
+                self._lock_depth = 1
                 try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    raise ClientError('Another client request is using this session.') from None
-                if self.path.exists():
-                    state = private_json(self.path)
-                    if not isinstance(state, dict) or state.get('identity') != self.identity:
-                        raise ClientError('State belongs to different pairing credentials; do not reuse it.')
-                    if set(state) != {'identity', 'next_id', 'pending', 'last'} or type(state['next_id']) is not int or not 1 <= state['next_id'] <= 2**64:
-                        raise ClientError('Invalid session state.')
-                    if state['pending'] is not None and not isinstance(state['pending'], dict):
-                        raise ClientError('Invalid pending request state.')
-                    if state['last'] is not None and (not isinstance(state['last'], dict) or set(state['last']) != {'request', 'response'}):
-                        raise ClientError('Invalid recovery state.')
-                else:
-                    state = {'identity': self.identity, 'next_id': 1, 'pending': None, 'last': None}
-                yield state
+                    yield
+                finally:
+                    self._lock_depth = 0
             finally:
                 os.close(fd)
+
+    def _load_state(self):
+        if self.path.exists():
+            state = private_json(self.path)
+            if isinstance(state, dict) and state.get('identity') != self.identity and self.credentials_path:
+                # Another process renewed the session: adopt its saved token.
+                try:
+                    saved = private_json(self.credentials_path)
+                    candidate = hashlib.sha256(json.dumps({k: v for k, v in saved.items() if k not in ('agent_name', 'session_expires_at')}, sort_keys=True).encode()).hexdigest()
+                except (OSError, ValueError, ClientError):
+                    candidate = None
+                if candidate == state.get('identity'):
+                    self._close_transport()
+                    self._load_credentials(saved)
+            if not isinstance(state, dict) or state.get('identity') != self.identity:
+                raise ClientError('State belongs to different pairing credentials; do not reuse it.')
+            if set(state) != {'identity', 'next_id', 'pending', 'last'} or type(state['next_id']) is not int or not 1 <= state['next_id'] <= 2**64:
+                raise ClientError('Invalid session state.')
+            if state['pending'] is not None and not isinstance(state['pending'], dict):
+                raise ClientError('Invalid pending request state.')
+            if state['last'] is not None and (not isinstance(state['last'], dict) or set(state['last']) != {'request', 'response'}):
+                raise ClientError('Invalid recovery state.')
+            return state
+        return {'identity': self.identity, 'next_id': 1, 'pending': None, 'last': None}
 
     @staticmethod
     def _command(op, args):
         if op not in ('events.subscribe', 'run.begin', 'run.update', 'run.end', 'run.status', 'capabilities', 'system.snapshot', 'app.launch', 'app.close', 'app.install', 'app.install.status', 'decrypt.start', 'decrypt.status', 'screen.on', 'screen.off', 'system.reboot',
-                      'input.acquire', 'input.heartbeat', 'input.cancel', 'input.release', 'input.status', 'input.submit', 'fs.stat', 'fs.list', 'touch.panels', 'app.list', 'fs.mkdir', 'fs.move', 'fs.trash', 'fs.purge', 'acl.request', 'acl.status', 'acl.audit', 'macro.acquire', 'plugins.list', 'performance.measure', 'performance.watch', 'performance.read', 'performance.cancel', 'app.running', 'events.start', 'events.read', 'events.stop', 'livearea.schema', 'log.start', 'log.read', 'log.stop', 'content.list', 'livearea.layout', 'livearea.blob', 'dialog.events.start', 'dialog.events.read', 'dialog.events.stop', 'macro.enqueue', 'content.delete.status', 'content.delete.changes', 'content.audit', 'content.delete.preview', 'content.scope', 'content.delete.request', 'content.albums'):
+                      'input.acquire', 'input.heartbeat', 'input.cancel', 'input.release', 'input.status', 'input.submit', 'fs.stat', 'fs.list', 'touch.panels', 'app.list', 'fs.mkdir', 'fs.move', 'fs.trash', 'fs.purge', 'acl.request', 'acl.status', 'acl.audit', 'macro.acquire', 'plugins.list', 'performance.measure', 'performance.watch', 'performance.read', 'performance.cancel', 'app.running', 'events.start', 'events.read', 'events.stop', 'livearea.schema', 'log.start', 'log.read', 'log.stop', 'content.list', 'livearea.layout', 'livearea.blob', 'dialog.events.start', 'dialog.events.read', 'dialog.events.stop', 'macro.enqueue', 'content.delete.status', 'content.delete.changes', 'content.audit', 'content.delete.preview', 'content.scope', 'content.delete.request', 'content.albums', 'session.ping', 'session.extend'):
             raise ClientError('Unsupported operation.')
         if not isinstance(args, dict):
             raise ClientError('Arguments must be an object.')
@@ -489,17 +802,20 @@ class VitaClient:
         return {'op': op, 'args': dict(args)}
 
     def _ensure_screen(self):
-        if self.manage_screen and not self._screen_owned:
-            reply = self._call_raw('screen.on', {})
-            if reply.get('status') != 'accepted':
-                raise ClientError('Screen-on was rejected; access session did not start.')
+        # Best effort: most commands work with the display off, and a refused
+        # screen-on must not block the command itself.
+        if self.manage_screen and not self._screen_owned and not self._screen_tried:
+            self._screen_tried = True
+            self._call_raw('screen.on', {})
 
     def close(self):
         """Finish the access session, then close transport. Reconnects use only transport cleanup."""
         had_error = sys.exc_info()[0] is not None
         try:
             if self._screen_owned and self.screen_off_when_done:
-                screen_off_if_idle(self)
+                # Cleanup must not hold the caller for a full recovery window.
+                with self.recovery_limit(10):
+                    screen_off_if_idle(self)
         except Exception as exc:
             self._screen_cleanup_error = exc
             if not had_error:
@@ -508,6 +824,7 @@ class VitaClient:
             print('Vita screen cleanup failed: ' + str(exc), file=sys.stderr)
         finally:
             self._screen_owned = False
+            self._screen_tried = False
             self._close_transport()
 
     def _close_transport(self):
@@ -524,19 +841,22 @@ class VitaClient:
         context.verify_mode = ssl.CERT_NONE
         with private_pem(self.client_certificate) as certificate, private_pem(self.client_key) as key:
             context.load_cert_chain(certificate, key, password=lambda: '')
-        connection = http.client.HTTPSConnection(self.host, self.port, timeout=self.timeout, context=context)
+        connection = http.client.HTTPSConnection(self.host, self.port, timeout=max(self.timeout, CONNECT_TIMEOUT) if self.retry_disconnect else self.timeout, context=context)
         try:
             connection.connect()
             certificate = connection.sock.getpeercert(binary_form=True)
             if not certificate or not hmac.compare_digest(hashlib.sha256(certificate).hexdigest(), self.pin):
-                raise ClientError('Device certificate does not match the paired fingerprint; no token sent.')
+                raise PinMismatchError('Device certificate does not match the paired fingerprint; no token sent. '
+                                       'Check vita_ip points at the paired Vita.')
+            set_keepalive(connection.sock)
+            connection.sock.settimeout(self.timeout)
         except ConnectionRefusedError as exc:
             connection.close()
-            raise ConnectionRefusedError(connection_refused_message()) from exc
+            raise ConnectionRefusedError(connection_refused_message(self.port)) from exc
         except TimeoutError as exc:
             connection.close()
-            raise TimeoutError('Vita connection timed out. '+connection_setup_hint()+
-                               ' Also check the Vita IP, connectivity and whether another serve owns the connection.') from exc
+            raise TimeoutError('Vita connection timed out (%s:%d did not complete TCP/TLS setup). Check the Vita is awake '
+                               'and on Wi-Fi and vita_ip is current. '%(self.host,self.port)+connection_setup_hint()) from exc
         except ssl.SSLError as exc:
             connection.close()
             raise ssl.SSLError(str(exc)+' '+connection_setup_hint()) from exc
@@ -546,34 +866,71 @@ class VitaClient:
         self._connection = connection
         return connection
 
-    def _exchange(self, request):
-        try:
-            return self._exchange_once(request)
-        except ClientError as exc:
-            # Replay the exact retained command ID once after a dead socket.
-            # The Vita cache prevents duplicate effects; no new pairing/grant.
-            if not self.retry_disconnect or not isinstance(exc.__cause__,
-                    (http.client.RemoteDisconnected, BrokenPipeError, ConnectionResetError)):
+    def _open(self):
+        """Return a pinned connection or raise NotSentError (nothing was sent)."""
+        connection = self._connection
+        if connection is not None and connection.sock is not None:
+            return connection
+        self._close_transport()
+        while True:
+            try:
+                return self._connect()
+            except NotSentError:
                 raise
-            import time
-            time.sleep(1)
-            return self._exchange_once(request)
+            except ClientError as exc:
+                raise NotSentError(str(exc)) from exc
+            except ConnectionRefusedError as exc:
+                # A fresh session's command listener starts just after its
+                # token is issued; wait for it rather than renewing again.
+                remaining = self.command_ready_until - time.monotonic()
+                if remaining > 0:
+                    time.sleep(min(0.5, remaining))
+                    continue
+                raise NotSentError(str(exc), refused=True) from exc
+            except (OSError, http.client.HTTPException, ValueError) as exc:
+                detail = str(exc) or type(exc).__name__
+                if isinstance(exc, OSError) and not isinstance(exc, (TimeoutError, ssl.SSLError)):
+                    detail += ' (check the Vita is awake and on the network, and vita_ip is current)'
+                raise NotSentError('Could not connect to the Vita (%s: %s); nothing was sent.' % (type(exc).__name__, detail)) from exc
+
+    def _send(self, connection, path, body, content_type):
+        """Send one request; failure before the last byte means it never ran."""
+        try:
+            # Never let HTTPSConnection implicitly reconnect: every new socket
+            # must pass the pin check before receiving the bearer credential.
+            connection.request('POST', path, body=body, headers={
+                'Content-Type': content_type, 'Authorization': 'Bearer ' + self.token,
+                'Connection': 'keep-alive'})
+        except (OSError, http.client.HTTPException) as exc:
+            self._close_transport()
+            # The Vita parses a request only once all of it arrived.
+            raise NotSentError('Connection dropped before the request was fully sent (%s); nothing ran.' % (str(exc) or type(exc).__name__)) from exc
+
+    def _receive(self, connection, wait=None):
+        sock = connection.sock
+        previous = None
+        if wait is not None and hasattr(sock, 'settimeout') and not hasattr(connection, 'getresponse_wait'):
+            previous = sock.gettimeout()
+            sock.settimeout(wait)
+        try:
+            if hasattr(connection, 'getresponse_wait'):
+                return connection.getresponse_wait(wait if wait is not None else self.response_timeout)
+            return connection.getresponse()
+        finally:
+            if previous is not None and connection.sock is sock:
+                sock.settimeout(previous)
+
+    def _exchange(self, request):
+        return self._exchange_once(request)
 
     def _exchange_once(self, request):
         payload = json.dumps(request, separators=(',', ':'), ensure_ascii=True).encode()
         if len(payload) > 131072:
             raise ClientError('Request exceeds device limit.')
+        connection = self._open()
+        self._send(connection, '/v1/command', payload, 'application/json')
         try:
-            # Never let HTTPSConnection implicitly reconnect: every new socket
-            # must pass the pin check before receiving the bearer credential.
-            connection = self._connection
-            if connection is None or connection.sock is None:
-                self._close_transport()
-                connection = self._connect()
-            connection.request('POST', '/v1/command', body=payload, headers={
-                'Content-Type': 'application/json', 'Authorization': 'Bearer ' + self.token,
-                'Connection': 'keep-alive'})
-            response = connection.getresponse()
+            response = self._receive(connection, self.response_timeout)
             lengths = response.headers.get_all('Content-Length', [])
             if response.headers.get_all('Transfer-Encoding') or response.headers.get_all('Content-Encoding'):
                 raise ClientError('Unsupported response framing.')
@@ -583,40 +940,122 @@ class VitaClient:
             data = response.read(size + 1)
             if len(data) != size:
                 raise ClientError('Truncated or oversized response.')
+            if response.will_close:
+                self._close_transport()
             if response.status == 401:
-                raise ClientError('Pairing grant is unknown, expired or revoked.')
+                self._close_transport()
+                raise GrantExpiredError('The Vita session token expired or was revoked; the command did not run.')
+            if response.status == 503:
+                raise ServiceBusyError('The Vita was not ready to run commands yet (input monitor still starting); nothing ran.')
             if response.status != 200:
-                raise ClientError('Device rejected the HTTP request (status %d).' % response.status)
+                rejected = NotExecutedError('Device rejected the HTTP request (status %d); nothing ran.' % response.status)
+                rejected.retryable = False
+                raise rejected
             if response.headers.get('Content-Type', '').lower() != 'application/json':
                 raise ClientError('Unexpected response content type.')
             result = strict_json(data)
+            if isinstance(result, dict) and result.get('v') == 1 and result.get('id') is None and result.get('status') == 'error':
+                # Rejected before the ID was reserved: unknown operation on an
+                # older plugin, or the protocol workspace was momentarily busy.
+                code = result.get('error', {}).get('code') if isinstance(result.get('error'), dict) else None
+                raise CommandRejected('The Vita rejected %s before running it: %s' % (request['op'], json.dumps(result.get('error'))),
+                                      result, retryable=code == -2)
             if not isinstance(result, dict) or type(result.get('v')) is not int or result.get('v') != 1 or result.get('id') != request['id'] or result.get('status') not in ('ok', 'accepted', 'error'):
                 raise ClientError('Response does not match the pending command.')
-            if response.will_close:
-                self._close_transport()
+            self.last_exchange = time.monotonic()
             return result
-        except (OSError, http.client.HTTPException, ValueError, RecursionError) as exc:
+        except NotExecutedError:
+            raise
+        except (OSError, http.client.HTTPException, ValueError, RecursionError, ClientError) as exc:
             self.last_transport_error = type(exc).__name__
             self._close_transport()
             detail=str(exc) or type(exc).__name__
-            raise ClientError('Transport/response failed (%s: %s); pending command retained for recovery.' % (type(exc).__name__,detail)) from exc
+            raise UncertainError('Sent %s (id %s) but no complete reply arrived (%s: %s); it stays pending and is '
+                                 'replayed with the same ID, which cannot run it twice.' % (request['op'], request['id'], type(exc).__name__, detail)) from exc
         except BaseException:
             self._close_transport()
             raise
 
+    def _read_retry(self, fn):
+        """Retry an ID-less read (frame, file, audit) across reconnects."""
+        return self._retrying(fn, ())
+
+    def _retrying(self, attempt, uncertain=(UncertainError,)):
+        """Run attempt until it succeeds or the trouble outlasts the recovery window.
+
+        The window counts from the first failure, so a long but healthy wait
+        does not eat into it. Only failures that leave nothing half-done, or
+        whose exact request is replayed by ID, are retried."""
+        failing_since = None
+        delay = 0.5
+        self.last_recovery_error = None
+        while True:
+            try:
+                return attempt()
+            except (NotExecutedError,) + tuple(uncertain) as exc:
+                if isinstance(exc, NotExecutedError) and not exc.retryable:
+                    raise
+                now = time.monotonic()
+                window = self._window()
+                failing_since = now if failing_since is None else failing_since
+                if self._recovering or now - failing_since >= window:
+                    raise self._final(exc, window)
+                self._recover(exc)
+                remaining = window - (time.monotonic() - failing_since)
+            time.sleep(max(0, min(delay, remaining)))
+            delay = min(delay * 2, 5)
+
+    def _final(self, exc, window=None):
+        """Name what recovery tried before the caller sees the failure."""
+        window = self._window() if window is None else window
+        if window and not self._recovering and not getattr(exc, '_reported', False):
+            extra = ' Kept retrying for %d s.' % window
+            if self.last_recovery_error:
+                extra += ' Last session renewal attempt: ' + self.last_recovery_error
+            exc.args = ((str(exc) + extra),) + exc.args[1:]
+            exc._reported = True
+        return exc
+
+    def connection_lost(self):
+        """Give a Vita reopening its listener time before renewing the session."""
+        self.command_ready_until = max(self.command_ready_until, time.monotonic() + LISTENER_RESET_WAIT)
+
+    def _recover(self, exc):
+        """Prepare the next attempt: reconnect, or renew via the session hook."""
+        self._close_transport()
+        if isinstance(exc, UncertainError) or (isinstance(exc, NotSentError) and not exc.refused):
+            self.connection_lost()
+        if self.session_hook is None:
+            return
+        self._recovering = True
+        try:
+            self.session_hook(self, exc)
+            self.last_recovery_error = None
+        except Exception as hook_error:
+            # Keep trying until the window ends; report the latest cause.
+            self.last_recovery_error = str(hook_error) or type(hook_error).__name__
+        finally:
+            self._recovering = False
+
     def frame(self):
         """Return (JPEG bytes, metadata) without consuming a command sequence ID."""
         self._ensure_screen()
-        with self._locked_state():
+        # Right after display-on the compositor may not have a frame yet.
+        deadline = time.monotonic() + 3
+        while True:
             try:
-                connection = self._connection
-                if connection is None or connection.sock is None:
-                    self._close_transport()
-                    connection = self._connect()
-                connection.request('POST', '/v1/frame', body=b'{}', headers={
-                    'Content-Type': 'application/json', 'Authorization': 'Bearer ' + self.token,
-                    'Connection': 'keep-alive'})
-                response = connection.getresponse()
+                return self._read_retry(self._frame_once)
+            except NativeFrameError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.25)
+
+    def _frame_once(self):
+        with self._locked_state():
+            connection = self._open()
+            self._send(connection, '/v1/frame', b'{}', 'application/json')
+            try:
+                response = self._receive(connection)
                 lengths = response.headers.get_all('Content-Length', [])
                 if response.headers.get_all('Transfer-Encoding') or response.headers.get_all('Content-Encoding'):
                     raise ClientError('Unsupported frame response framing.')
@@ -625,8 +1064,12 @@ class VitaClient:
                 data = response.read(int(lengths[0]) + 1)
                 if len(data) != int(lengths[0]):
                     raise ClientError('Truncated frame response.')
+                if response.will_close:
+                    self._close_transport()
                 if response.status == 401:
-                    raise ClientError('Pairing grant is unknown, expired or revoked.')
+                    raise GrantExpiredError('The Vita session token expired or was revoked.')
+                if response.status == 503:
+                    raise ServiceBusyError('The Vita was not ready to capture yet.')
                 if response.status != 200:
                     if response.headers.get('Content-Type', '').lower() == 'application/json' and len(data) <= 1024:
                         try:
@@ -654,18 +1097,16 @@ class VitaClient:
                     metadata[key.lower().replace('-', '_')] = int(values[0])
                 if not metadata['width'] or not metadata['height'] or not metadata['process'] or metadata['capture_end'] < metadata['capture_start']:
                     raise ClientError('Invalid frame metadata.')
-                if response.will_close:
-                    self._close_transport()
+                self.last_exchange = time.monotonic()
                 return data, metadata
-            except NativeFrameError:
+            except (NativeFrameError, NotExecutedError):
                 # The full, validated error response has been consumed. A
                 # missing framebuffer does not invalidate the event channel.
-                if response.will_close:
-                    self._close_transport()
                 raise
-            except (OSError, http.client.HTTPException, ValueError):
+            except (OSError, http.client.HTTPException, ValueError) as exc:
                 self._close_transport()
-                raise ClientError('Frame transport failed; request a fresh frame.') from None
+                # Captures have no effect, so a lost one is simply taken again.
+                raise NotExecutedError('Frame transport failed (%s); capturing again.' % (str(exc) or type(exc).__name__)) from None
             except BaseException:
                 self._close_transport()
                 raise
@@ -677,16 +1118,14 @@ class VitaClient:
             raise ClientError('Invalid file range.')
         payload = json.dumps({'path': path, 'offset': str(offset), 'length': length}, separators=(',', ':')).encode()
         self._ensure_screen()
+        return self._read_retry(lambda: self._file_chunk_once(payload, offset, length))
+
+    def _file_chunk_once(self, payload, offset, length):
         with self._locked_state():
+            connection = self._open()
+            self._send(connection, '/v1/file/read', payload, 'application/json')
             try:
-                connection = self._connection
-                if connection is None or connection.sock is None:
-                    self._close_transport()
-                    connection = self._connect()
-                connection.request('POST', '/v1/file/read', body=payload, headers={
-                    'Content-Type': 'application/json', 'Authorization': 'Bearer ' + self.token,
-                    'Connection': 'keep-alive'})
-                response = connection.getresponse()
+                response = self._receive(connection)
                 lengths = response.headers.get_all('Content-Length', [])
                 if response.headers.get_all('Transfer-Encoding') or response.headers.get_all('Content-Encoding'):
                     raise ClientError('Unsupported file response framing.')
@@ -695,10 +1134,20 @@ class VitaClient:
                 data = response.read(int(lengths[0]) + 1)
                 if len(data) != int(lengths[0]):
                     raise ClientError('Truncated file response.')
+                if response.will_close:
+                    self._close_transport()
+                if response.status == 401:
+                    raise GrantExpiredError('The Vita session token expired or was revoked.')
+                if response.status == 503:
+                    raise ServiceBusyError('The Vita was not ready to read files yet.')
                 if response.status != 200:
-                    detail = strict_json(data)
+                    try:
+                        detail = strict_json(data)
+                    except (ValueError, UnicodeError):
+                        detail = None
                     code = detail.get('code') if isinstance(detail, dict) else None
-                    raise ClientError('File read rejected (HTTP %d, native code %s).' % (response.status, code))
+                    reason = {403: 'denied by the Vita file policy', 500: 'the path does not exist or could not be read'}.get(response.status, 'rejected')
+                    raise FileReadRejected('File read %s (HTTP %d, native code %s).' % (reason, response.status, code), response.status, code)
                 if response.headers.get('Content-Type', '').lower() != 'application/octet-stream':
                     raise ClientError('Unexpected file response content type.')
                 metadata = {}
@@ -713,13 +1162,14 @@ class VitaClient:
                 metadata['modified'] = modified[0]
                 if metadata['offset'] != offset or offset > metadata['file_bytes'] or len(data) != min(length, metadata['file_bytes'] - offset):
                     raise ClientError('File response does not match the requested range.')
-                if response.will_close:
-                    self._close_transport()
+                self.last_exchange = time.monotonic()
                 return data, metadata
+            except (NotExecutedError, FileReadRejected):
+                raise
             except (OSError, http.client.HTTPException, ValueError) as exc:
                 self.last_transport_error = type(exc).__name__
                 self._close_transport()
-                raise ClientError('File transport failed; download is incomplete.') from exc
+                raise NotExecutedError('File transport failed (%s); reading this range again.' % (str(exc) or type(exc).__name__)) from exc
             except BaseException:
                 self._close_transport()
                 raise
@@ -767,18 +1217,22 @@ class VitaClient:
             raise ClientError('Upload metadata exceeds its limit.')
         payload = struct.pack('!I', len(metadata)) + metadata + data
         self._ensure_screen()
-        with self._locked_state() as state:
-            if state['pending'] is not None:
-                raise ClientError('Recover the pending command before uploading.')
+        # An earlier command's lost reply is settled first, never left blocking.
+        self.settle_pending()
+        # Native staging compares overlapping chunks and commit/recover look up
+        # this operation's journal, so the same step is safe to send again.
+        try:
+            return self._retrying(lambda: self._upload_once(request, action, payload, progress), (UploadTransportError,))
+        except NotExecutedError as exc:
+            raise UploadTransportError(str(exc)) from exc
+
+    def _upload_once(self, request, action, payload, progress):
+        actions = ('begin', 'chunk', 'verify', 'commit', 'recover')
+        with self._locked_state():
+            connection = self._open()
+            self._send(connection, '/v1/file/upload', payload, 'application/octet-stream')
             wait_sock = None
             try:
-                connection = self._connection
-                if connection is None or connection.sock is None:
-                    self._close_transport()
-                    connection = self._connect()
-                connection.request('POST', '/v1/file/upload', body=payload, headers={
-                    'Content-Type': 'application/octet-stream', 'Authorization': 'Bearer ' + self.token,
-                    'Connection': 'keep-alive'})
                 wait_timeout = upload_wait_timeout(request, action, self.timeout)
                 if hasattr(connection, 'getresponse_wait'):
                     response = connection.getresponse_wait(wait_timeout, progress)
@@ -793,10 +1247,16 @@ class VitaClient:
                 if len(lengths) != 1 or not re.fullmatch('[0-9]+', lengths[0]) or not 0 < int(lengths[0]) <= 2048:
                     raise ClientError('Invalid upload response length.')
                 raw = response.read(int(lengths[0]) + 1)
+                if len(raw) != int(lengths[0]):
+                    raise ClientError('Truncated upload response.')
+                if response.will_close:
+                    self._close_transport()
                 if response.status == 401:
-                    raise UploadTransportError('Upload session expired or was revoked; reconnect with the saved identity and retain the transfer state.')
-                if len(raw) != int(lengths[0]) or response.status != 200 or response.headers.get('Content-Type', '').lower() != 'application/json':
-                    raise ClientError('Upload response rejected or truncated (HTTP %d).' % response.status)
+                    raise GrantExpiredError('Upload session expired or was revoked; the step did not run.')
+                if response.status == 503:
+                    raise ServiceBusyError('The Vita was not ready for the upload step yet; it did not run.')
+                if response.status != 200 or response.headers.get('Content-Type', '').lower() != 'application/json':
+                    raise ClientError('Upload response rejected (HTTP %d).' % response.status)
                 result = strict_json(raw)
                 required = {'v', 'operation_id', 'action', 'code', 'received', 'verified', 'complete', 'sequence', 'effect_started', 'readback_required'}
                 if not isinstance(result, dict) or set(result) != required or type(result['v']) is not int or result['v'] != 1 or result['operation_id'] != request['operation_id'] or type(result['action']) is not int or result['action'] != actions.index(action):
@@ -814,11 +1274,13 @@ class VitaClient:
                     result['timings_us']={name:values[0] for name,values in timing_headers.items()}
                 if int(result['received']) > int(request['bytes']) or any(type(result[k]) is not bool for k in ('verified', 'complete', 'effect_started', 'readback_required')):
                     raise ClientError('Invalid upload flags or progress.')
-                if response.will_close:self._close_transport()
+                self.last_exchange = time.monotonic()
                 return result
+            except NotExecutedError:
+                raise
             except (OSError, http.client.HTTPException, ValueError) as exc:
                 self._close_transport()
-                raise UploadTransportError('Upload transport failed (%s: %s); resume using the saved transfer state.' % (type(exc).__name__,str(exc) or type(exc).__name__)) from exc
+                raise UploadTransportError('Upload transport failed (%s: %s); the same step is sent again from the saved transfer state.' % (type(exc).__name__,str(exc) or type(exc).__name__)) from exc
             except BaseException:
                 self._close_transport()
                 raise
@@ -832,16 +1294,14 @@ class VitaClient:
             raise ClientError('Invalid audit cursor.')
         payload = json.dumps({'after': str(after)}, separators=(',', ':')).encode()
         self._ensure_screen()
+        return self._read_retry(lambda: self._audit_once(payload))
+
+    def _audit_once(self, payload):
         with self._locked_state():
+            connection = self._open()
+            self._send(connection, '/v1/audit', payload, 'application/json')
             try:
-                connection = self._connection
-                if connection is None or connection.sock is None:
-                    self._close_transport()
-                    connection = self._connect()
-                connection.request('POST', '/v1/audit', body=payload, headers={
-                    'Content-Type': 'application/json', 'Authorization': 'Bearer ' + self.token,
-                    'Connection': 'keep-alive'})
-                response = connection.getresponse()
+                response = self._receive(connection)
                 lengths = response.headers.get_all('Content-Length', [])
                 if response.headers.get_all('Transfer-Encoding') or response.headers.get_all('Content-Encoding'):
                     raise ClientError('Unsupported audit response framing.')
@@ -850,17 +1310,22 @@ class VitaClient:
                 data = response.read(int(lengths[0]) + 1)
                 if len(data) != int(lengths[0]):
                     raise ClientError('Truncated audit response.')
+                if response.will_close:
+                    self._close_transport()
+                if response.status == 401:
+                    raise GrantExpiredError('The Vita session token expired or was revoked.')
+                if response.status == 503:
+                    raise ServiceBusyError('The Vita was not ready yet.')
                 if response.status != 200:
                     raise ClientError('Audit export rejected (HTTP %d).' % response.status)
                 if response.headers.get('Content-Type', '').lower() != 'application/json':
                     raise ClientError('Unexpected audit content type.')
-                result = strict_json(data)
-                if response.will_close:
-                    self._close_transport()
-                return result
+                return strict_json(data)
+            except NotExecutedError:
+                raise
             except (OSError, http.client.HTTPException, ValueError):
                 self._close_transport()
-                raise ClientError('Audit transport failed; saved cursor is unchanged.') from None
+                raise NotExecutedError('Audit transport failed; saved cursor is unchanged, reading again.') from None
             except BaseException:
                 self._close_transport()
                 raise
@@ -898,10 +1363,126 @@ class VitaClient:
             raise ClientError('Invalid pending request state.')
         self._command(request['op'], request['args'])
         result = self._exchange(request)
-        state['last'] = {'request': request, 'response': result}
+        if request['op'] not in QUIET_OPS:
+            state['last'] = {'request': request, 'response': result}
         state['pending'] = None
         durable_json(self.path, state)
         return result
+
+    def _abandon(self, state, reason):
+        """Retire a pending request whose session is gone; record it first."""
+        pending = state['pending']
+        record = archive_pending(self.path, pending, reason)
+        state['pending'] = None
+        durable_json(self.path, state)
+        if record is not None:
+            self._emit_notice({'type': 'command.unresolved', **record})
+        return record
+
+    def _settle(self, state, notify=True):
+        """Replay an earlier command's pending request under its own ID."""
+        pending = state['pending']
+        try:
+            reply = self._finish(state)
+        except GrantExpiredError:
+            # The session that may have run it is gone; its reply cannot be
+            # replayed and resending under a new session could repeat it.
+            self._abandon(state, 'session_lost')
+            raise
+        except NotExecutedError as exc:
+            if exc.retryable:
+                raise
+            self._abandon(state, 'replay_rejected: ' + str(exc))
+            return None
+        if notify and pending['op'] not in QUIET_OPS:
+            self._emit_notice({'type': 'command.recovered', 'id': pending['id'], 'op': pending['op'],
+                               'args': pending['args'], 'reply': json.loads(json.dumps(reply))})
+        self._track_screen_reply(pending['op'], reply)
+        return reply
+
+    def _lost(self, pending, record):
+        if record is None:
+            record = next((r for r in reversed(read_unresolved(self.path, 50))
+                           if r.get('id') == pending.get('id') and r.get('op') == pending.get('op')), None)
+        if record is None:
+            record = {'id': pending.get('id'), 'op': pending.get('op'), 'args': pending.get('args'),
+                      'reason': 'session_lost', 'instruction': 'Outcome unknown: check the resulting Vita state before repeating it.'}
+        return UncertainOutcomeError(
+            '%s (id %s) was sent, but its reply was lost and the Vita session it ran under ended, so its '
+            'outcome cannot be recovered. It is recorded in %s and was not resent. %s'
+            % (pending.get('op'), pending.get('id'), unresolved_path(self.path), record.get('instruction', '')), record)
+
+    def _attempt(self, command, ctx):
+        with self._locked_state() as state:
+            sent = ctx.get('sent')
+            if sent is not None:
+                identity, request = sent
+                pending = state['pending']
+                if identity != self.identity or pending is None or pending.get('id') != request['id']:
+                    # No longer pending under the session it was sent in.
+                    last = state['last']
+                    if identity == self.identity and last is not None and last['request'].get('id') == request['id']:
+                        return last['response']
+                    ctx['sent'] = None
+                    if command['op'] not in RESENDABLE_OPS:
+                        raise self._lost(request, None)
+            pending = state['pending']
+            if pending is not None and any(pending.get(k) != v for k, v in command.items()):
+                self._settle(state)
+            if state['pending'] is not None:
+                # This same command was sent before without a reply.
+                pending = state['pending']
+                ctx['sent'] = (self.identity, pending)
+                try:
+                    return self._finish(state)
+                except NotExecutedError as exc:
+                    if exc.retryable and not isinstance(exc, GrantExpiredError):
+                        raise
+                    lost = exc
+                ctx['sent'] = None
+                if command['op'] in RESENDABLE_OPS:
+                    # Safe to ask again under the renewed session.
+                    state['pending'] = None
+                    durable_json(self.path, state)
+                    raise lost
+                raise self._lost(pending, self._abandon(state, 'session_lost'))
+            if state['next_id'] == 2**64:
+                raise ClientError('Session request IDs are exhausted.')
+            state['pending'] = {'v': 1, 'id': str(state['next_id']), **command}
+            state['next_id'] += 1
+            # Persist the exact command before any possible remote effect.
+            durable_json(self.path, state)
+            ctx['sent'] = (self.identity, state['pending'])
+            try:
+                return self._finish(state)
+            except NotExecutedError:
+                # It certainly did not run: forget it so nothing replays it later.
+                ctx['sent'] = None
+                state['pending'] = None
+                durable_json(self.path, state)
+                raise
+
+    def settle_pending(self, notify=True):
+        """Resolve any pending request now: its reply, or an unresolved record."""
+        def attempt():
+            with self._locked_state() as state:
+                if state['pending'] is None:
+                    return None
+                return self._settle(state, notify)
+        try:
+            return self._retrying(attempt)
+        except GrantExpiredError:
+            # Archived by _settle; the caller's own request renews the session.
+            return None
+
+    def _maybe_extend(self):
+        """Extend before expiry, so commands never straddle a token change."""
+        if self._extend_unsupported or self.session_deadline is None or not self.session_expired(600):
+            return
+        try:
+            self.extend_session()
+        except ClientError:
+            pass
 
     def list_entries(self, op, args=None):
         """Complete listings by default; limit/page are presentation options."""
@@ -1038,30 +1619,26 @@ class VitaClient:
 
     def _call_raw(self, op, args=None):
         command = self._command(op, {} if args is None else args)
-        if op not in ('screen.on', 'screen.off'):
+        if op not in ('screen.on', 'screen.off') and op not in QUIET_OPS:
             self._ensure_screen()
-        with self._locked_state() as state:
-            if state['pending'] is not None:
-                if any(state['pending'].get(k) != v for k, v in command.items()):
-                    raise ClientError('An uncertain command is pending; recover it before issuing another.')
+        if op not in QUIET_OPS and not self._recovering:
+            self._maybe_extend()
+        ctx = {}
+        try:
+            result = self._retrying(lambda: self._attempt(command, ctx))
+        except CommandRejected as exc:
+            # A complete native rejection is an ordinary error reply.
+            result = exc.reply
+        if op in ('app.install','app.install.status') and result.get('status')=='ok':
+            operation_id=command['args'].get('operation_id')
+            installs=getattr(self,'_screen_installs',set())
+            if result.get('result',{}).get('running') is False:
+                installs.discard(operation_id)
             else:
-                if state['next_id'] == 2**64:
-                    raise ClientError('Session request IDs are exhausted.')
-                state['pending'] = {'v': 1, 'id': str(state['next_id']), **command}
-                state['next_id'] += 1
-                # Persist the exact command before any possible remote effect.
-                durable_json(self.path, state)
-            result = self._finish(state)
-            if op in ('app.install','app.install.status') and result.get('status')=='ok':
-                operation_id=command['args'].get('operation_id')
-                installs=getattr(self,'_screen_installs',set())
-                if result.get('result',{}).get('running') is False:
-                    installs.discard(operation_id)
-                else:
-                    installs.add(operation_id)
-                self._screen_installs=installs
-            self._track_screen_reply(op,result)
-            return result
+                installs.add(operation_id)
+            self._screen_installs=installs
+        self._track_screen_reply(op,result)
+        return result
 
     def _track_screen_reply(self,op,result):
         if result.get('status')!='accepted':
@@ -1073,15 +1650,27 @@ class VitaClient:
             self._screen_owned=False
 
     def recover(self):
+        """Return the pending command's reply, or the last one if none is pending."""
         with self._locked_state() as state:
-            if state['pending'] is not None:
-                op=state['pending'].get('op')
-                reply=self._finish(state)
-                self._track_screen_reply(op,reply)
+            pending = state['pending']
+        if pending is not None:
+            reply = self.settle_pending(notify=False)
+            if reply is not None:
                 return reply
+            record = next((n for n in reversed(self.notices) if n.get('type') == 'command.unresolved' and n.get('id') == pending.get('id')), None)
+            if record is None:
+                return {'status': 'ok', 'result': {'pending': None, 'recovered': None,
+                                                    'message': 'The pending %s could not be replayed and needs no recovery.' % pending.get('op')}}
+            return {'status': 'unconfirmed', 'message': 'The pending command could not be replayed; its outcome is unknown.',
+                    'unresolved': record}
+        with self._locked_state() as state:
             if state['last'] is not None:
                 return state['last']['response']
-            raise ClientError('No command is available to recover.')
+        unresolved = read_unresolved(self.path, 5)
+        result = {'pending': None, 'message': 'Nothing is pending; no recovery needed.'}
+        if unresolved:
+            result['unresolved_recent'] = unresolved
+        return {'status': 'ok', 'result': result}
 
 
 def main(argv=None, *, screen_off_when_done=True, host=None, agent_name=None):

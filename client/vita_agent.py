@@ -11,9 +11,11 @@ import threading
 import time
 import uuid
 
-from vita_client import ClientError, NativeFrameError, UploadError, VitaClient, private_json, strict_json, validate_host, validate_agent_name, connection_refused_message
+from vita_client import ClientError, NativeFrameError, UncertainOutcomeError, UploadError, VitaClient, private_json, strict_json, validate_host, validate_agent_name, connection_refused_message
 
 CONFIG_ENV = "VITA_AGENT_CONFIG_DIR"
+# bootstrap's default directory, used when the environment names none.
+DEFAULT_CONFIG_DIR = Path(__file__).resolve().parent.parent / 'agent' / 'vita-agent-use'
 
 
 def parser():
@@ -174,13 +176,49 @@ def native_args(a):
     return result
 
 
-def wait_runner(runner):
+def cancelled(a):
+    """True once the CLI that started this command under serve has gone away."""
+    flag=getattr(a,'_cancel',None)
+    return flag is not None and flag.is_set()
+
+
+def create_output(path):
+    """Write a new host file, replacing an existing regular file atomically."""
+    path=Path(path)
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise ClientError('Output path exists and is not a regular file: '+str(path))
+    fd=os.open(path.parent,os.O_RDONLY|os.O_DIRECTORY)
+    os.close(fd)
+    import tempfile
+    fd,temp=tempfile.mkstemp(prefix='.'+path.name+'.',dir=path.parent)
+    return fd,Path(temp)
+
+
+def write_output(path,writer):
+    """Run writer(stream) into a temporary file and move it into place."""
+    path=Path(path)
+    replaced=path.exists()
+    fd,temp=create_output(path)
+    try:
+        with os.fdopen(fd,'wb') as stream:
+            value=writer(stream)
+            stream.flush();os.fsync(stream.fileno())
+        os.replace(temp,path)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):temp.unlink()
+        raise
+    return value,replaced
+
+
+def wait_runner(runner,a=None,emit_result=emit):
     last=None
     while True:
         r=runner.status()
         state=r.get('result',r).get('state')
-        if state!=last:emit(r);last=state
+        if state!=last:emit_result(r);last=state
         if state not in ('running','queued'):return r
+        if a is not None and cancelled(a):
+            runner.stop();return runner.status()
         time.sleep(.1)
 
 
@@ -197,7 +235,7 @@ def execute(a,c,emit_result=emit):
         if a.no_wait:return result
         deadline=time.monotonic()+a.timeout
         while result.get('status')=='ok' and result.get('result',{}).get('running'):
-            if time.monotonic()>=deadline:
+            if time.monotonic()>=deadline or cancelled(a):
                 return {**result,'status':'unconfirmed','message':'Installation still running; query app install-status with this operation_id.'}
             time.sleep(1)
             result=c.call('app.install.status',{'operation_id':args['operation_id']})
@@ -210,15 +248,20 @@ def execute(a,c,emit_result=emit):
         from system_metadata import collect
         return {'status':'ok','result':collect(c)}
     if g=='screen':
-        fd=os.open(a.output,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
-        try:
-            with os.fdopen(fd,'wb') as f:
-                data,meta=c.frame();f.write(data)
-        except BaseException:
-            a.output.unlink();raise
-        return {'status':'ok','file':str(a.output),'bytes':len(data),**meta}
+        def capture(stream):
+            data,meta=c.frame();stream.write(data);return len(data),meta
+        (size,meta),replaced=write_output(a.output,capture)
+        result={'status':'ok','file':str(a.output),'bytes':size,**meta}
+        if replaced:result['replaced']=True
+        return result
     if g=='fs':
-        if action=='download':return c.download(a.path,a.output)
+        if action=='download':
+            fd,temp=create_output(a.output);os.close(fd);temp.unlink()
+            replaced=Path(a.output).exists()
+            result=c.download(a.path,temp)
+            os.replace(temp,a.output);result['file']=str(a.output)
+            if replaced:result['replaced']=True
+            return result
         from upload import upload
         return upload(c,a.source,a.destination,a.transfer_state,a.overwrite,a.expected_sha256,a.yes,progress=emit_result,skip_hash=a.skip_hash)
     if g in ('macro','touch','input'):
@@ -234,11 +277,15 @@ def execute(a,c,emit_result=emit):
             elif g=='input':runner.start(read_json(a.file),name='input')
             elif action=='run':runner.run(a.title_id,a.name,a.repeats)
             else:raise ClientError('Local macro operation was not dispatched.')
-            return wait_runner(runner)
+            return wait_runner(runner,a,emit_result)
         finally:runner.stop()
     if g=='performance':
         from performance import collect
-        for sample in collect(c,window_ms=a.window_ms if action=='measure' else None,duration_s=a.seconds if action=='watch' else None):emit_result(sample)
+        for sample in collect(c,window_ms=a.window_ms if action=='measure' else None,duration_s=a.seconds if action=='watch' else None):
+            emit_result(sample)
+            if cancelled(a):
+                with contextlib.suppress(ClientError):c.call('performance.cancel')
+                break
         return None
     if g=='livearea':
         from livearea import download_blob
@@ -255,7 +302,7 @@ def execute(a,c,emit_result=emit):
             while True:
                 time.sleep(.5)
                 r=w.status()
-                if r['result']['state']!='running':return r
+                if r['result']['state']!='running' or cancelled(a):return r
         finally:w.stop()
     if g=='acl':
         from request_acl import sync_audit
@@ -263,7 +310,7 @@ def execute(a,c,emit_result=emit):
         rid=a.request_id or uuid.uuid4().hex
         r=c.call('acl.status',{'request_id':rid}) if a.request_id else c.call('acl.request',{'request_id':rid,'path':a.path})
         emit_result(r);deadline=time.monotonic()+a.timeout
-        while r.get('status')=='ok' and r['result']['state']=='pending' and time.monotonic()<deadline:
+        while r.get('status')=='ok' and r['result']['state']=='pending' and time.monotonic()<deadline and not cancelled(a):
             time.sleep(1);r=c.call('acl.status',{'request_id':rid})
         return r
     if g=='config':
@@ -297,10 +344,12 @@ def execute(a,c,emit_result=emit):
 def selected_config():
     value = os.environ.get(CONFIG_ENV)
     if not value or not value.strip() or '\0' in value:
+        if (DEFAULT_CONFIG_DIR / 'config.json').exists():
+            # A new shell often lacks the export; bootstrap's default is unambiguous.
+            print('vita-agent: VITA_AGENT_CONFIG_DIR is unset; using the bootstrap default ' + str(DEFAULT_CONFIG_DIR) + '.', file=sys.stderr)
+            return DEFAULT_CONFIG_DIR.resolve() / 'config.json'
         raise ClientError('Set VITA_AGENT_CONFIG_DIR to the directory chosen in bootstrap (containing config.json and pc/).')
     folder = Path(value).expanduser()
-    if not folder.is_absolute():
-        raise ClientError('VITA_AGENT_CONFIG_DIR must be an absolute directory path.')
     if not folder.is_dir():
         raise ClientError('VITA_AGENT_CONFIG_DIR is not an existing directory: ' + str(folder))
     return folder.resolve() / 'config.json'
@@ -313,9 +362,14 @@ def load_config(options):
         raise ClientError('Missing client config: ' + str(config_path) + '. Run bootstrap and export VITA_AGENT_CONFIG_DIR to its chosen directory.')
     config = private_json(config_path)
     keys = {'device_dir', 'credentials', 'state', 'macro_store', 'screen_off_when_done', 'vita_ip', 'agent_name'}
-    if not isinstance(config, dict) or not config or set(config) - keys:
+    if not isinstance(config, dict) or not config:
         raise ClientError('Client config must contain device_dir or credentials/state paths.')
+    unknown = sorted(set(config) - keys)
+    if unknown:
+        print('vita-agent: ignoring unknown config.json keys: ' + ', '.join(unknown), file=sys.stderr)
     for key, value in config.items():
+        if key not in keys:
+            continue
         if key in ('vita_ip', 'agent_name'):
             (validate_host if key == 'vita_ip' else validate_agent_name)(value)
             setattr(options,key,value)
@@ -359,6 +413,33 @@ def main(argv=None):
             host=a.host or a.vita_ip or (private_json(a.credentials)['host'] if a.credentials else None)
             if not host:p.error('diagnostics requires --host or credentials')
             emit(query(host,input_sample=a.action=='input',logging=a.action=='log'));return 0
+        if a.group=='session' and a.action in ('pair','connect') and a.credentials and a.state:
+            import server
+            if server.running(a):
+                # The running server owns the connection; it renews in place.
+                r=server.request(a,'session.renew',{'pair':a.action=='pair'},emit_output=lambda value:print(json.dumps(value,ensure_ascii=False),file=sys.stderr,flush=True))
+                emit(r);return 0 if r.get('status')=='ok' else 1
+        if a.group=='session' and a.action=='connect' and a.credentials and a.state and a.credentials.exists():
+            # A live saved session needs no new token, and keeps its replay cache.
+            try:
+                client=VitaClient(private_json(a.credentials),a.state,timeout=20,screen_off_when_done=a.screen_off_when_done,**connection_options(a))
+                client.recovery_window=5
+                expired=getattr(client,'session_expired',lambda margin=0:False)
+                reply=client.call('session.ping') if not expired(60) else None
+                if reply is not None and reply.get('status')=='ok':
+                    client.close();client=None
+                    emit({'status':'ok','result':{'session':'reused'}});return 0
+                if reply is not None and reply.get('status')=='error':
+                    # Older plugins without session.ping.
+                    reply=client.call('capabilities')
+                    if reply.get('status')=='ok':
+                        client.close();client=None
+                        emit({'status':'ok','result':{'session':'reused'}});return 0
+            except (ClientError,OSError,ValueError):
+                pass
+            if client is not None:
+                with contextlib.suppress(Exception):client._close_transport()
+                client=None
         if a.group=='session' and a.action in ('provision','pair','connect'):
             if not a.device_dir:p.error('session setup requires device_dir in config.json')
             import pair_vita
@@ -375,7 +456,7 @@ def main(argv=None):
                         if not host:raise ClientError('Set vita_ip in the selected config.')
                         pair_vita.provision(host,a.agent_name or 'Agent')
                     try:
-                        creds=pair_vita.pair(resume=a.action=='connect',**connection_options(a))
+                        creds=pair_vita.pair(resume=a.action=='connect',credentials_path=a.credentials,state_path=a.state,**connection_options(a))
                     except ConnectionRefusedError:
                         if a.action!='connect' or not a.credentials.exists():
                             raise
@@ -389,7 +470,7 @@ def main(argv=None):
                             raise ClientError('Saved command session was rejected; start serve or wait for the session to expire.')
                         reused=True
                     if not reused:
-                        client=pair_vita.wait_for_commands(creds,screen_off_when_done=a.screen_off_when_done)
+                        client=pair_vita.wait_for_commands(creds,screen_off_when_done=a.screen_off_when_done,state_path=a.state)
             emit({'status':'ok','result':{'session':'reused'}} if reused else {'status':'ok'});return 0
         if not a.state:raise ClientError('Set device_dir or state in the selected config.')
         if a.group=='macro' and a.action in ('save','load','compile'):
@@ -403,6 +484,8 @@ def main(argv=None):
         if not a.credentials:raise ClientError('Set device_dir or credentials in the selected config.')
         import server
         if a.group=='serve':
+            if server.running(a):
+                emit(server.already_serving(a));return 0
             server.AgentServer(a).serve();return 0
         if a.group in ('server','run'):
             if a.group=='run':
@@ -423,16 +506,38 @@ def main(argv=None):
             r=server.request(a,method,args);emit(r);return 0 if r.get('status')=='ok' else 1
         if server.running(a):
             values=vars(a).copy()
+            stdin_copy=None
+            if str(getattr(a,'file',None))=='-':
+                # The server cannot read this process's stdin: pass a private copy.
+                import tempfile
+                folder=a.state.parent/'server';folder.mkdir(mode=0o700,parents=True,exist_ok=True)
+                fd,name=tempfile.mkstemp(prefix='stdin-',suffix='.json',dir=folder)
+                with os.fdopen(fd,'wb') as stream:
+                    data=sys.stdin.buffer.read(16777217)
+                    if len(data)>16777216:raise ClientError('JSON file exceeds 16 MiB.')
+                    stream.write(data)
+                stdin_copy=Path(name);values['file']=stdin_copy
             for key,value in list(values.items()):
                 if isinstance(value,Path) and str(value)!='-':values[key]=str(value.resolve())
-            if any(str(getattr(a,key,None))=='-' for key in ('file',)):
-                raise ClientError('Use a JSON file when submitting commands to the PC server.')
-            r=server.request(a,'execute',values,emit_progress=emit)
+            try:
+                r=server.request(a,'execute',values,emit_progress=emit,emit_output=emit)
+            finally:
+                if stdin_copy is not None:
+                    with contextlib.suppress(FileNotFoundError):stdin_copy.unlink()
             if r is not None:emit(r)
             return 1 if r is not None and (r.get('status') in ('error','client_error','unconfirmed') or r.get('code',0) or r.get('state')=='failed' or r.get('result',{}).get('state')=='failed') else 0
         client=VitaClient(private_json(a.credentials),a.state,timeout=20,screen_off_when_done=a.screen_off_when_done,**connection_options(a))
+        import renewal
+        renewal.attach(client,a)
         r=execute(a,client)
-        client.close();client=None
+        try:
+            client.close()
+        except (ClientError,OSError) as e:
+            # Cleanup never replaces the command's own result.
+            if isinstance(r,dict):r['cleanup_error']=str(e)
+            else:print('Screen cleanup failed: '+str(e),file=sys.stderr)
+        if isinstance(r,dict) and getattr(client,'notices',None):r['notices']=list(client.notices)
+        client=None
         if r is not None:
             if a.group=='fs' and a.action=='list' and a.human and r.get('status')=='ok':
                 info=r['result'];print(info['path']);print('Filename\tDate modified\tSize')
@@ -444,10 +549,12 @@ def main(argv=None):
     except KeyboardInterrupt:return 130
     except UploadError as e:
         emit(e.as_result());return 1
-    except NativeFrameError as e:
+    except (NativeFrameError,UncertainOutcomeError) as e:
         emit(e.as_result());return 1
-    except ConnectionRefusedError:
-        emit({'status':'client_error','message':connection_refused_message()});return 1
+    except ConnectionRefusedError as e:
+        # A bare errno message gets the full explanation.
+        message=str(e) if e.errno is None and str(e) else connection_refused_message()
+        emit({'status':'client_error','message':message});return 1
     except (ClientError,OSError,ValueError,TypeError) as e:
         emit({'status':'client_error','message':str(e)});return 1
     finally:

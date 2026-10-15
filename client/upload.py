@@ -10,7 +10,7 @@ from pathlib import Path
 import stat
 import time
 import uuid
-from vita_client import VitaClient, ClientError, UploadError, private_json, durable_json
+from vita_client import VitaClient, ClientError, UploadError, private_json, durable_json, ensure_private
 
 
 def checked(result, allow_readback=False):
@@ -68,9 +68,7 @@ def upload(client, source, destination, transfer_state, overwrite=False, expecte
         return result
     lock_fd = os.open(str(transfer_state) + '.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
-        lock_info = os.fstat(lock_fd)
-        if not stat.S_ISREG(lock_info.st_mode) or lock_info.st_uid != os.getuid() or lock_info.st_mode & 0o077:
-            raise ClientError('Transfer lock must be a private user-owned regular file.')
+        ensure_private(lock_fd, str(transfer_state) + '.lock', 'Transfer lock')
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
         with os.fdopen(fd, 'rb') as stream:
@@ -93,11 +91,22 @@ def upload(client, source, destination, transfer_state, overwrite=False, expecte
                     'overwrite': overwrite, 'expected_sha256': expected_sha256, 'yes': yes}
             if skip_hash:base['skip_hash']=True
             fields={'v','source','device','request','phase'}|({'source_stat'} if skip_hash else set())
-            if transfer_state.exists():
-                saved = private_json(transfer_state)
-                if not isinstance(saved, dict) or set(saved) != fields or type(saved['v']) is not int or saved['v'] != 1 or saved['source'] != str(source) or saved['device'] != client.pin or not isinstance(saved['request'], dict) or saved['phase'] not in ('transfer', 'commit', 'done') or {k: v for k, v in saved['request'].items() if k != 'operation_id'} != base or (skip_hash and saved['source_stat']!=list(signature)):
-                    raise ClientError('Transfer state does not match this source, device and operation.')
-            else:
+            saved = private_json(transfer_state) if transfer_state.exists() else None
+            if saved is not None:
+                matches = (isinstance(saved, dict) and set(saved) == fields and type(saved['v']) is int and saved['v'] == 1 and saved['source'] == str(source) and saved['device'] == client.pin and isinstance(saved['request'], dict) and saved['phase'] in ('transfer', 'commit', 'done') and {k: v for k, v in saved['request'].items() if k != 'operation_id'} == base and (not skip_hash or saved['source_stat'] == list(signature)))
+                if not matches:
+                    if isinstance(saved, dict) and saved.get('phase') == 'done':
+                        # That upload finished; this state file can start a new one.
+                        saved = None
+                    else:
+                        previous = saved.get('request', {}) if isinstance(saved, dict) else {}
+                        raise ClientError('Transfer state does not match this source, device and options: %s belongs to an '
+                                          'unfinished upload of %s to %s (phase %s). Rerun that exact upload, with the source '
+                                          'unchanged, to finish it, or use a different --transfer-state for a new upload.'
+                                          % (transfer_state, saved.get('source') if isinstance(saved, dict) else 'unknown',
+                                             previous.get('path', 'unknown') if isinstance(previous, dict) else 'unknown',
+                                             saved.get('phase') if isinstance(saved, dict) else 'unknown'))
+            if saved is None:
                 saved = {'v': 1, 'source': str(source), 'device': client.pin,
                          'request': {**base, 'operation_id': uuid.uuid4().hex}, 'phase': 'transfer'}
                 if skip_hash:saved['source_stat']=list(signature)

@@ -17,7 +17,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
-from vita_client import durable_json, private_json, ClientError, VitaClient, validate_host, validate_agent_name, connection_setup_hint, connection_refused_message
+from vita_client import durable_json, private_json, ClientError, VitaClient, validate_host, validate_agent_name, connection_setup_hint, connection_refused_message, ensure_private, archive_pending, LOCK_WAIT, NotSentError
 
 BASE=Path.home()/'.local/share/vita-agent-use'
 
@@ -56,25 +56,51 @@ def provision(host,name):
     print('Client fingerprint for native prompt:',client_pin.upper())
 
 @contextmanager
-def pairing_state_lock():
-    path=BASE/'pc/state.json.lock'
+def pairing_state_lock(state_path=None):
+    path=str(state_path or BASE/'pc/state.json')+'.lock'
     fd=os.open(path,os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600)
     try:
-        info=os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077 or info.st_uid!=os.getuid():
-            raise ClientError('State lock must be a private regular file.')
-        try: fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
-        except BlockingIOError: raise ClientError('An existing command is using this session; retry pairing after it finishes.') from None
+        ensure_private(fd,path,'State lock')
+        # A running command finishes first; pairing then proceeds.
+        deadline=time.monotonic()+LOCK_WAIT
+        while True:
+            try:
+                fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB);break
+            except BlockingIOError:
+                if time.monotonic()>=deadline:
+                    raise ClientError('Another vita-agent process has held this session for %d s; wait for its command to finish or stop it.'%LOCK_WAIT) from None
+                time.sleep(.05)
         yield
     finally: os.close(fd)
 
 
-def pair(resume=False, *, host=None, agent_name=None, timeout=75):
-    with pairing_state_lock():
-        return pair_locked(resume, host=host, agent_name=agent_name, timeout=timeout)
+def pair(resume=False, *, host=None, agent_name=None, timeout=75, state_lock=None, on_archived=None,
+         credentials_path=None, state_path=None, log=print):
+    with (state_lock() if state_lock is not None else pairing_state_lock(state_path)):
+        return pair_locked(resume, host=host, agent_name=agent_name, timeout=timeout, on_archived=on_archived,
+                           credentials_path=credentials_path, state_path=state_path, log=log)
 
 
-def pair_locked(resume=False, *, host=None, agent_name=None, timeout=75):
+def replace_state(state, credentials, reason, on_archived=None):
+    """Start the new session's ID sequence; a lost reply is journaled, not kept."""
+    new_identity=VitaClient(credentials,state).identity
+    if state.exists():
+        try:
+            old=private_json(state)
+        except (OSError,ValueError,ClientError):
+            old=None
+        if isinstance(old,dict) and old.get('identity')==new_identity:
+            return
+        pending=old.get('pending') if isinstance(old,dict) else None
+        if pending is not None:
+            # Its session is gone, so its reply can never be replayed.
+            record=archive_pending(state,pending,reason)
+            if record is not None and on_archived is not None:on_archived(record)
+    durable_json(state,{'identity':new_identity,'next_id':1,'pending':None,'last':None})
+
+
+def pair_locked(resume=False, *, host=None, agent_name=None, timeout=75, on_archived=None,
+                credentials_path=None, state_path=None, log=print):
     config=dict(private_json(BASE/'pc/pairing.json'))
     if host is not None:config['host']=host
     if agent_name is not None:config['agent_name']=agent_name
@@ -89,6 +115,9 @@ def pair_locked(resume=False, *, host=None, agent_name=None, timeout=75):
     started_at=time.time()
     try:
         connection.connect()
+        if connection.sock is not None:
+            from vita_client import set_keepalive
+            set_keepalive(connection.sock)
         pin=hashlib.sha256(connection.sock.getpeercert(binary_form=True)).hexdigest()
         expected_pin=config.get('certificate_sha256')
         if expected_pin is None and resume:
@@ -96,7 +125,7 @@ def pair_locked(resume=False, *, host=None, agent_name=None, timeout=75):
         if expected_pin is not None and pin!=expected_pin:
             raise ClientError('Vita certificate pin mismatch.')
         if not resume:
-            print('Compare this client fingerprint with the Vita prompt:',config['client_fingerprint'].upper(),flush=True)
+            log('Compare this client fingerprint with the Vita prompt:',config['client_fingerprint'].upper())
         body=json.dumps(dict(v=1,agent_name=config['agent_name']),separators=(',',':')).encode()
         connection.request('POST','/v1/session' if resume else '/v1/pair',body=body,headers={'Content-Type':'application/json','Connection':'close'})
         response=connection.getresponse(); data=response.read(1025)
@@ -119,20 +148,14 @@ def pair_locked(resume=False, *, host=None, agent_name=None, timeout=75):
         credentials={k:config[k] for k in ('host','agent_name','certificate_sha256','client_certificate','client_key')}
         # Start before the exchange so the host deadline is conservative.
         credentials.update(port=result['command_port'],token=token,session_expires_at=started_at+3600)
-        durable_json(BASE/'pc/credentials.json',credentials)
-        state=BASE/'pc/state.json'
-        if state.exists():
-            old=private_json(state)
-            new_identity=VitaClient(credentials,state).identity
-            if not isinstance(old,dict) or old.get('identity')!=new_identity:
-                # Preserve uncertain old operations; their grants are distinct
-                # from the newly approved token and must not share request IDs.
-                fd,backup=tempfile.mkstemp(prefix='previous-state-',suffix='.json',dir=state.parent)
-                os.close(fd); os.replace(state,backup)
-        print('Session accepted.' if resume else 'Pairing accepted.', 'Credentials saved privately; command endpoint port',result['command_port'])
+        durable_json(Path(credentials_path or BASE/'pc/credentials.json'),credentials)
+        # The new grant has its own request IDs. An old request whose reply
+        # never arrived is recorded in unresolved.jsonl rather than replayed.
+        replace_state(Path(state_path or BASE/'pc/state.json'),credentials,'session_renewed' if resume else 'paired',on_archived)
+        log('Session accepted.' if resume else 'Pairing accepted.', 'Credentials saved privately; command endpoint port',result['command_port'])
         return credentials
     except ConnectionRefusedError as exc:
-        raise ConnectionRefusedError(connection_refused_message()) from exc
+        raise ConnectionRefusedError(connection_refused_message(config['port'])) from exc
     except ssl.SSLError as exc:
         if getattr(exc,'reason',None)=='TLSV1_ALERT_UNKNOWN_CA' or 'TLSV1_ALERT_UNKNOWN_CA' in str(exc):
             raise ClientError(
@@ -148,21 +171,19 @@ def pair_locked(resume=False, *, host=None, agent_name=None, timeout=75):
             'finish its work and stop that serve process, then retry. The Vita keeps every approved identity. '
             'If no server is active, check the Vita IP and connectivity. '+connection_setup_hint()
         ) from exc
+    except OSError as exc:
+        raise ClientError('Could not reach the Vita pairing port %s:%d (%s). Check the Vita is awake and on Wi-Fi '
+                          'and vita_ip is its current address.'%(config['host'],config['port'],exc.strerror or exc)) from exc
     finally: connection.close()
 
-def wait_for_commands(credentials,timeout=15,*,screen_off_when_done=True):
-    client=VitaClient(credentials,BASE/'pc/state.json',timeout=5,screen_off_when_done=screen_off_when_done)
-    deadline=time.monotonic()+timeout
+def wait_for_commands(credentials,timeout=15,*,screen_off_when_done=True,state_path=None):
+    client=VitaClient(credentials,state_path or BASE/'pc/state.json',timeout=5,screen_off_when_done=screen_off_when_done)
+    # The command listener starts just after the token is issued.
+    client.command_ready_until=time.monotonic()+timeout
     try:
-        while True:
-            try:
-                result=client.call('capabilities',{})
-                if result.get('status')!='ok': raise ClientError('Command service rejected its capabilities request.')
-                return client
-            except ClientError as exc:
-                if not isinstance(exc.__cause__,ConnectionRefusedError) or time.monotonic()>=deadline:
-                    raise
-                time.sleep(1)
+        result=client.call('capabilities',{})
+        if result.get('status')!='ok': raise ClientError('Command service rejected its capabilities request.')
+        return client
     except BaseException:
         client.close(); raise
 
