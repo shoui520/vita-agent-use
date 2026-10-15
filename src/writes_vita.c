@@ -276,7 +276,7 @@ int vau_vita_file_upload(void *context, const struct vau_upload_message *m,
 
 	if (!rc && out->phase == VAU_WRITE_COMPLETE && out->sequence) {
 		status->received = r->bytes;
-		status->verified = 1;
+		status->verified = !!r->sha256[0];
 	}
 
 	uint64_t worked = clock_us(NULL);

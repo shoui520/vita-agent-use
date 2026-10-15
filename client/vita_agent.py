@@ -69,6 +69,7 @@ def parser():
     c = cmd(g, 'upload'); c.add_argument('source', type=Path); c.add_argument('destination')
     c.add_argument('--transfer-state', type=Path, required=True); c.add_argument('--overwrite', action='store_true')
     c.add_argument('--expected-sha256', default=''); c.add_argument('--yes', action='store_true')
+    c.add_argument('--skip-hash', action='store_true', help='Skip PC/Vita content hashing; verify size only.')
     for a in ('mkdir','move','trash','purge'):
         c = cmd(g, a, 'fs.'+a); c.add_argument('path'); write(c)
         if a == 'move': c.add_argument('destination')
@@ -219,7 +220,7 @@ def execute(a,c,emit_result=emit):
     if g=='fs':
         if action=='download':return c.download(a.path,a.output)
         from upload import upload
-        return upload(c,a.source,a.destination,a.transfer_state,a.overwrite,a.expected_sha256,a.yes,progress=emit_result)
+        return upload(c,a.source,a.destination,a.transfer_state,a.overwrite,a.expected_sha256,a.yes,progress=emit_result,skip_hash=a.skip_hash)
     if g in ('macro','touch','input'):
         from macro_runner import MacroRunner
         runner=MacroRunner(c,a.macro_store or a.state.parent/'macros')

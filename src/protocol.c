@@ -1468,7 +1468,7 @@ static int request_locked(struct vau_session *s, const struct vau_native_api *ap
 		        "\"plugins\":{\"page_entries_max\":2,\"source\":\"native_module_lists\",\"categories\":\"taihen_config_sections\"},"
 		        "\"filesystem\":{\"page_entries_max\":8,\"offset_max\":4294967295,\"scan_reads_max\":128,\"continuation_idle_us\":30000000,\"snapshot\":false,\"read_path\":\"/v1/file/read\",\"read_bytes_max\":16384},"
 		        "\"audit\":{\"export_path\":\"/v1/audit\",\"page_events_max\":2,\"response_bytes_max\":16384},"
-		        "\"upload\":{\"path\":\"/v1/file/upload\",\"metadata_bytes_max\":3072,\"chunk_bytes_max\":%u,\"encoding\":\"be32_json_length_json_raw\"},"
+		        "\"upload\":{\"path\":\"/v1/file/upload\",\"metadata_bytes_max\":3072,\"chunk_bytes_max\":%u,\"skip_hash\":true,\"encoding\":\"be32_json_length_json_raw\"},"
 		        "\"input\":{\"events_max\":1024,\"duration_us_max\":3600000000,\"repeats_max\":1000000,"
 		        "\"lease_us\":5000000,\"button_mask\":62457,\"start_clock\":\"device_monotonic_us\",\"start_delay_us_min\":10000,\"start_delay_us_max\":1000000,"
 		        "\"process_binding\":false,\"routing\":\"native_current_target\","

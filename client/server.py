@@ -21,7 +21,7 @@ import sys
 import threading
 import time
 import uuid
-from vita_client import ClientError, NativeFrameError, UploadError, VitaClient, durable_json, private_json, strict_json, screen_off_if_idle
+from vita_client import ClientError, NativeFrameError, UploadError, UploadTransportError, VitaClient, durable_json, private_json, strict_json, screen_off_if_idle, connection_setup_hint, upload_wait_timeout
 
 IPC_IDLE_TIMEOUT = 65
 MAX_IPC = 1024 * 1024
@@ -113,8 +113,18 @@ class PushTransport:
         self.connection._HTTPConnection__state=http.client._CS_IDLE
 
     def getresponse(self):
-        try:result=self.responses.get(timeout=self.timeout)
-        except queue.Empty:raise TimeoutError('Vita response timed out.') from None
+        return self.getresponse_wait(self.timeout)
+
+    def getresponse_wait(self,timeout,progress=None):
+        deadline=time.monotonic()+timeout
+        while True:
+            remaining=deadline-time.monotonic()
+            if remaining<=0:raise TimeoutError('Vita response timed out.')
+            try:
+                result=self.responses.get(timeout=min(5,remaining) if progress is not None else remaining)
+                break
+            except queue.Empty:
+                if progress is not None:progress()
         if isinstance(result,Exception):raise OSError('Vita connection lost: '+str(result)) from result
         return result
 
@@ -152,6 +162,30 @@ class ServerClient(VitaClient):
         self.command_ready_until=0
         self._connection=PushTransport(connection,self.event_sink,self.disconnect_sink)
         return self._connection
+
+
+class UploadClient:
+    """Renew between serialized steps; replay only the same durable upload ID."""
+    def __init__(self,server):self.server=server
+    def __getattr__(self,name):return getattr(self.server.client,name)
+    def upload_step(self,request,action,offset=0,data=b'',*,progress=None):
+        server=self.server
+        for attempt in range(3):
+            session=server._session_status()
+            reserve=upload_wait_timeout(request,action,server.client.timeout)+60
+            if not server.connected:server._reconnect()
+            elif server._renew_due() or (session['expires_in_s'] is not None and session['expires_in_s']<reserve):
+                server._new_session()
+            try:
+                reply=server.client.upload_step(request,action,offset,data,progress=progress)
+                server.last_activity=time.monotonic()
+                return reply
+            except UploadTransportError:
+                if attempt==2:raise
+                # Native staging compares overlapping chunks; commit/recover
+                # look up this ID's journal. No new operation is created.
+                server.connected=False
+                if progress is not None:progress()
 
 
 class EventStore:
@@ -497,9 +531,17 @@ class AgentServer:
         if not isinstance(args,dict):raise ClientError('Server arguments must be an object.')
         if method=='server.status':return {'status':'ok','result':{'connected':self.connected and self._session_status()['state']!='expired','session':self._session_status(),'connection_error':self.connection_error,'run':self.runs.status(),'latest_event':self.store.sequence,'socket':str(self.socket_path),'event_journal':str(self.store.path)}}
         if method=='events.read':return {'status':'ok','result':self.store.read(**args)}
+        recovery=method=='execute' and args.get('group')=='session' and args.get('action')=='recover'
+        if recovery:
+            if self.runs.busy():raise ClientError('Session recovery conflicts with the active run.')
+            # Recover the exact pending request before screen.on, subscription
+            # or renewal can try to issue another command or replace its grant.
+            with self.rpc_guard:return self.client.recover()
         if method not in ('run.status','run.cancel'):
             with self.rpc_guard:
-                if self.connected and self._renew_due() and not self.runs.busy():self._new_session()
+                if not self.runs.busy():
+                    if not self.connected:self._reconnect()
+                    elif self._renew_due():self._new_session()
         if method=='run.start':return {'status':'ok','result':self.runs.start(args)}
         if method=='run.status':return {'status':'ok','result':self.runs.status()}
         if method=='run.cancel':return {'status':'ok','result':self.runs.cancel()}
@@ -536,7 +578,8 @@ class AgentServer:
                     if progress is not None and event.get('status')=='progress':progress(event)
                 def execute():
                     if options.group!='screen' or options.action not in ('on','off'):checked(self.client.call('screen.on'))
-                    result=vita_agent.execute(options,self.client,emit_result=command_progress)
+                    client=UploadClient(self) if options.group=='fs' and options.action=='upload' else self.client
+                    result=vita_agent.execute(options,client,emit_result=command_progress)
                     self.last_activity=time.monotonic()
                     return result
                 try:
@@ -625,10 +668,17 @@ def request(options,method,args=None,*,emit_progress=None):
                     latest=reply.get('result')
                     if not isinstance(latest,dict):raise ClientError('Invalid PC server progress.')
                     if emit_progress is not None:emit_progress(reply)
-    except (TimeoutError,OSError) as exc:
-        if latest is not None and latest.get('type')=='upload':
-            raise UploadError('PC server progress stopped: '+(str(exc) or type(exc).__name__)+
+    except (TimeoutError,OSError,ClientError) as exc:
+        detail=str(exc) or type(exc).__name__
+        if isinstance(exc,(ConnectionRefusedError,FileNotFoundError)):
+            detail=('Local PC serve socket is unavailable; this does not show whether the Vita is reachable. '
+                    'Check VITA_AGENT_CONFIG_DIR and start serve with the same config/identity directory. '
+                    'A stopped server can leave a stale socket; do not start a duplicate server. '+connection_setup_hint())
+        if isinstance(latest,dict) and latest.get('type')=='upload':
+            raise UploadError('PC server progress stopped: '+detail+
                               '; the server may still be transferring. Wait for it to finish before resuming',latest) from exc
+        if isinstance(exc,(ConnectionRefusedError,FileNotFoundError)):
+            raise ClientError(detail) from exc
         raise
 
 

@@ -589,6 +589,10 @@ attempt_failed:
 	}
 done:
 	close_pair_sockets();
+	/* A network reset can invalidate admission while the fd still looks open.
+	 * Only successful handoff retains it for the command worker. */
+	if (rc < 0)
+		vau_net_close(&listener);
 	vau_pairing_tls_close(&network.pairing, rc);
 	vau_tls_server_free(&server);
 	if (ui.state == VAU_PAIR_WORK_DONE)
@@ -729,8 +733,10 @@ static int runtime_thread(SceSize args, void *argp)
 				    !vau_vita_decrypt_busy() && !vau_vita_content_inflight()) {
 					int waiting = vau_net_wait(&waiter, &listener, 0, 0);
 
-					if (waiting < 0)
-						stop_runtime("network cleanup stopped", waiting);
+					if (waiting < 0) {
+						network.commands.error = waiting;
+						break;
+					}
 					if (waiting > 0)
 						break;
 				}
@@ -752,6 +758,11 @@ static int runtime_thread(SceSize args, void *argp)
 				                                                : closed);
 			}
 		}
+
+		/* Waiters and command sockets have released ownership above. Drop a
+		 * failed admission socket too, so Wi-Fi recovery opens a fresh listener. */
+		if (rc < 0)
+			vau_net_close(&listener);
 
 		(void)vau_vita_file_list_reset();
 		(void)vau_content_legacy_reset();

@@ -21,12 +21,16 @@ def checked(result, allow_readback=False):
     return result
 
 
-def upload(client, source, destination, transfer_state, overwrite=False, expected_sha256='', yes=False, *, config_readback=None, progress=None):
+def upload(client, source, destination, transfer_state, overwrite=False, expected_sha256='', yes=False, *, config_readback=None, progress=None, skip_hash=False):
     VitaClient._command('fs.mkdir', {'operation_id':'0'*32,'path':destination,'yes':yes})
     if type(overwrite) is not bool or not isinstance(expected_sha256, str) or not re.fullmatch('(?:[0-9a-f]{64})?' if overwrite else '', expected_sha256):
         raise ClientError('Invalid optional original SHA256.')
     if overwrite and not yes:raise ClientError('Overwrite requires --yes.')
     is_config = destination.lower() in ('ur0:tai/config.txt', 'ux0:tai/config.txt', 'uma0:tai/config.txt')
+    if type(skip_hash) is not bool or (skip_hash and (is_config or expected_sha256)):
+        raise ClientError('Skipping hashes is unavailable for guarded config or an original SHA256 precondition.')
+    if skip_hash and not client.upload_skip_hash_supported():
+        raise ClientError('Installed plugin does not support --skip-hash; update the Shell plugin.')
     if is_config and overwrite and not expected_sha256:
         raise ClientError('Guarded config overwrite requires the original SHA256.')
     if is_config and config_readback is None:
@@ -39,7 +43,7 @@ def upload(client, source, destination, transfer_state, overwrite=False, expecte
             if not result['readback_required']:raise ClientError('Vita did not require config readback.')
             info['phase']='readback';report(force=True)
             return {**result, 'readback': config_readback()}
-        return result
+        return {**result,'verification':'size_only','hash_verified':False} if skip_hash else result
     source = Path(source).absolute()
     transfer_state = Path(transfer_state).absolute()
     info={'type':'upload','path':destination,'transfer_state':str(transfer_state),
@@ -56,7 +60,7 @@ def upload(client, source, destination, transfer_state, overwrite=False, expecte
         info.update(phase=phase,action=action)
         if changed:report(force=True)
         started=time.monotonic()
-        result=client.upload_step(request,action,offset,data)
+        result=client.upload_step(request,action,offset,data,progress=lambda:report(force=True))
         info['last_step_ms']=round((time.monotonic()-started)*1000,3)
         if 'timings_us' in result:info['last_step_native_us']=dict(result['timings_us'])
         if result['code']==0:info['received']=result['received']
@@ -72,25 +76,31 @@ def upload(client, source, destination, transfer_state, overwrite=False, expecte
         with os.fdopen(fd, 'rb') as stream:
             before = os.fstat(stream.fileno())
             if not stat.S_ISREG(before.st_mode):raise ClientError('Upload source must be a regular file.')
-            info['bytes']=str(before.st_size);info['phase']='hash';report(force=True)
-            digest = hashlib.sha256()
-            while block := stream.read(65536):
-                digest.update(block);report()
+            info['bytes']=str(before.st_size)
+            digest = None
+            if not skip_hash:
+                info['phase']='hash';report(force=True)
+                digest = hashlib.sha256()
+                while block := stream.read(65536):
+                    digest.update(block);report()
             signature = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
             def unchanged():
                 now = os.fstat(stream.fileno())
                 if (now.st_dev, now.st_ino, now.st_size, now.st_mtime_ns, now.st_ctime_ns) != signature:
                     raise ClientError('Upload source changed; commit was withheld.')
             unchanged()
-            base = {'path': destination, 'bytes': str(before.st_size), 'sha256': digest.hexdigest(),
+            base = {'path': destination, 'bytes': str(before.st_size), 'sha256': digest.hexdigest() if digest is not None else '',
                     'overwrite': overwrite, 'expected_sha256': expected_sha256, 'yes': yes}
+            if skip_hash:base['skip_hash']=True
+            fields={'v','source','device','request','phase'}|({'source_stat'} if skip_hash else set())
             if transfer_state.exists():
                 saved = private_json(transfer_state)
-                if not isinstance(saved, dict) or set(saved) != {'v', 'source', 'device', 'request', 'phase'} or type(saved['v']) is not int or saved['v'] != 1 or saved['source'] != str(source) or saved['device'] != client.pin or not isinstance(saved['request'], dict) or saved['phase'] not in ('transfer', 'commit', 'done') or {k: v for k, v in saved['request'].items() if k != 'operation_id'} != base:
+                if not isinstance(saved, dict) or set(saved) != fields or type(saved['v']) is not int or saved['v'] != 1 or saved['source'] != str(source) or saved['device'] != client.pin or not isinstance(saved['request'], dict) or saved['phase'] not in ('transfer', 'commit', 'done') or {k: v for k, v in saved['request'].items() if k != 'operation_id'} != base or (skip_hash and saved['source_stat']!=list(signature)):
                     raise ClientError('Transfer state does not match this source, device and operation.')
             else:
                 saved = {'v': 1, 'source': str(source), 'device': client.pin,
                          'request': {**base, 'operation_id': uuid.uuid4().hex}, 'phase': 'transfer'}
+                if skip_hash:saved['source_stat']=list(signature)
                 durable_json(transfer_state, saved)
             request = saved['request']
             info.update(operation_id=request['operation_id'],phase=saved['phase']);report(force=True)
@@ -107,7 +117,7 @@ def upload(client, source, destination, transfer_state, overwrite=False, expecte
                 # No commit intent was recorded: verify/commit the staged bytes
                 # with the same operation identity; never generate another ID.
                 unchanged();verified = check(step(request, 'verify'))
-                if not verified['verified']:raise ClientError('Vita did not verify the upload.')
+                if not skip_hash and not verified['verified']:raise ClientError('Vita did not verify the upload.')
             else:
                 result = check(step(request, 'begin'))
                 if result['complete']:
@@ -123,7 +133,7 @@ def upload(client, source, destination, transfer_state, overwrite=False, expecte
                     if next_offset != offset + len(block):raise ClientError('Unexpected upload offset; resume from the saved operation.')
                     offset = next_offset
                 unchanged();result = check(step(request, 'verify'))
-                if not result['verified']:raise ClientError('Vita did not verify the upload.')
+                if not skip_hash and not result['verified']:raise ClientError('Vita did not verify the upload.')
                 saved['phase'] = 'commit';durable_json(transfer_state, saved)
             unchanged();result = check(step(request, 'commit'))
             if not result['complete']:raise ClientError('Vita has not confirmed durable upload completion.')

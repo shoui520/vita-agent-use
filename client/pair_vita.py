@@ -17,7 +17,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
-from vita_client import durable_json, private_json, ClientError, VitaClient, validate_host, validate_agent_name
+from vita_client import durable_json, private_json, ClientError, VitaClient, validate_host, validate_agent_name, connection_setup_hint, connection_refused_message
 
 BASE=Path.home()/'.local/share/vita-agent-use'
 
@@ -107,7 +107,7 @@ def pair_locked(resume=False, *, host=None, agent_name=None, timeout=75):
                 except (ValueError,UnicodeError):
                     failure={}
                 if isinstance(failure,dict) and failure.get('error')=='identity_not_paired':
-                    raise ClientError('This PC identity is not paired. Run session pair and tap OK on the Vita once. Other approved identities are retained.')
+                    raise ClientError('This PC identity is not paired. '+connection_setup_hint()+' Other approved identities are retained.')
             raise ClientError('Saved-peer session rejected.' if resume else 'Pairing rejected.')
         result=json.loads(data)
         token=result.get('token','')
@@ -131,19 +131,22 @@ def pair_locked(resume=False, *, host=None, agent_name=None, timeout=75):
                 os.close(fd); os.replace(state,backup)
         print('Session accepted.' if resume else 'Pairing accepted.', 'Credentials saved privately; command endpoint port',result['command_port'])
         return credentials
+    except ConnectionRefusedError as exc:
+        raise ConnectionRefusedError(connection_refused_message()) from exc
     except ssl.SSLError as exc:
         if getattr(exc,'reason',None)=='TLSV1_ALERT_UNKNOWN_CA' or 'TLSV1_ALERT_UNKNOWN_CA' in str(exc):
             raise ClientError(
-                'Vita rejected this PC certificate (TLS unknown CA). The installed plugin may predate multi-identity pairing. '
+                'Vita rejected this PC certificate (TLS unknown CA). '+connection_setup_hint()+' '
+                'The installed plugin may predate multi-identity pairing. '
                 'Update the Shell plugin, then use session pair to approve this identity; other approvals are retained. '
                 'The trusted peer name/fingerprint is unavailable from this rejected handshake.'
             ) from exc
-        raise
+        raise ClientError(str(exc)+' '+connection_setup_hint()) from exc
     except TimeoutError as exc:
         raise ClientError(
             'Pairing/session connection timed out. Another PC server may still own the command connection; '
             'finish its work and stop that serve process, then retry. The Vita keeps every approved identity. '
-            'If no server is active, check the Vita IP and connectivity. Do not delete pairing files.'
+            'If no server is active, check the Vita IP and connectivity. '+connection_setup_hint()
         ) from exc
     finally: connection.close()
 

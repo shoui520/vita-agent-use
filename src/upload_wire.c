@@ -68,7 +68,7 @@ int vau_upload_wire_parse(const void *body, size_t bytes, const char *subject,
 	if (vau_json_parse(json, length, t, 32, &count) || t[0].type != VAU_JSON_OBJECT)
 		return VAU_INVALID;
 
-	unsigned seen               = 0;
+	unsigned seen = 0, skip_hash = 0;
 	struct vau_write_request *r = &out->request;
 
 	r->operation = VAU_FS_WRITE;
@@ -116,11 +116,13 @@ int vau_upload_wire_parse(const void *body, size_t bytes, const char *subject,
 			bit = !strcmp(key, "sha256") ? 32 : 64;
 			if (vau_json_ascii(json, &t[i + 1], bit == 32 ? r->sha256 : r->expected_sha256, 65))
 				return VAU_INVALID;
-		} else if (!strcmp(key, "overwrite") || !strcmp(key, "yes")) {
-			bit = !strcmp(key, "overwrite") ? 128 : 256;
+		} else if (!strcmp(key, "overwrite") || !strcmp(key, "yes") || !strcmp(key, "skip_hash")) {
+			bit = !strcmp(key, "overwrite") ? 128 : !strcmp(key, "yes") ? 256 : 512;
 			if (t[i + 1].type != VAU_JSON_TRUE && t[i + 1].type != VAU_JSON_FALSE)
 				return VAU_INVALID;
-			if (bit == 128)
+			if (bit == 512)
+				skip_hash = t[i + 1].type == VAU_JSON_TRUE;
+			else if (bit == 128)
 				r->overwrite = t[i + 1].type == VAU_JSON_TRUE;
 			else
 				r->yes = t[i + 1].type == VAU_JSON_TRUE;
@@ -134,7 +136,8 @@ int vau_upload_wire_parse(const void *body, size_t bytes, const char *subject,
 		seen |= bit;
 	}
 
-	if (seen != 511 || !hex(r->sha256, 64) ||
+	if ((seen != 511 && seen != 1023) || (skip_hash ? !!r->sha256[0] : !hex(r->sha256, 64)) ||
+	    (skip_hash && r->expected_sha256[0]) ||
 	    (r->overwrite ? (*r->expected_sha256 && !hex(r->expected_sha256, 64))
 	                  : !!r->expected_sha256[0])) {
 		return VAU_INVALID;

@@ -65,7 +65,7 @@ static int gate(struct vau_upload_context *c, const struct vau_write_request *r)
 {
 	if (!c || !c->journal || !c->policy || !c->clock || !c->stopped || !r ||
 	    r->operation != VAU_FS_WRITE || !memchr(r->path, 0, sizeof(r->path)) ||
-	    !memchr(r->sha256, 0, sizeof(r->sha256)) || !hex(r->sha256, 64) ||
+	    !memchr(r->sha256, 0, sizeof(r->sha256)) || (*r->sha256 && !hex(r->sha256, 64)) ||
 	    !memchr(r->expected_sha256, 0, sizeof(r->expected_sha256)) ||
 	    (r->overwrite ? (*r->expected_sha256 && !hex(r->expected_sha256, 64))
 	                  : !!*r->expected_sha256) ||
@@ -76,6 +76,18 @@ static int gate(struct vau_upload_context *c, const struct vau_write_request *r)
 
 	if (r->overwrite && !r->yes)
 		return VAU_DENIED;
+	if (!r->sha256[0]) {
+		char path[VAU_PATH_MAX];
+
+		if (vau_path_normalize(r->path, path, sizeof(path)))
+			return VAU_INVALID;
+		for (size_t i = 0; path[i]; i++)
+			if (path[i] >= 'A' && path[i] <= 'Z')
+				path[i] += 'a' - 'A';
+		if (r->expected_sha256[0] || !strcmp(path, "ur0:tai/config.txt") ||
+		    !strcmp(path, "ux0:tai/config.txt") || !strcmp(path, "uma0:tai/config.txt"))
+			return VAU_DENIED;
+	}
 
 	char stage[VAU_PATH_MAX];
 
@@ -563,16 +575,18 @@ int vau_upload_verify(struct vau_upload_context *c, const struct vau_write_reque
 	if (info.bytes != r->bytes)
 		return VAU_STALE;
 
-	rc = vau_upload_file_digest(c, stage, digest);
+	if (r->sha256[0]) {
+		rc = vau_upload_file_digest(c, stage, digest);
+		if (rc)
+			return rc;
+		if (strcmp(digest, r->sha256))
+			return VAU_STALE;
+	}
+
+	rc = audit(c, r, r->sha256[0] ? "stage_verified" : "stage_size_checked", r->bytes, 1);
 	if (rc)
 		return rc;
-	if (strcmp(digest, r->sha256))
-		return VAU_STALE;
 
-	rc = audit(c, r, "stage_verified", r->bytes, 1);
-	if (rc)
-		return rc;
-
-	out->verified = 1;
+	out->verified = !!r->sha256[0];
 	return VAU_OK;
 }

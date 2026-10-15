@@ -518,7 +518,7 @@ static int request_valid(const struct vau_write_request *r)
 	}
 
 	if (r->operation == VAU_FS_WRITE) {
-		return !r->recursive && hex(r->sha256, 64) &&
+		return !r->recursive && (!*r->sha256 || hex(r->sha256, 64)) &&
 		       (r->overwrite ? (!*r->expected_sha256 || hex(r->expected_sha256, 64))
 		                     : !*r->expected_sha256);
 	}

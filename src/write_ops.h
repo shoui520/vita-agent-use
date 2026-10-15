@@ -19,7 +19,8 @@ struct vau_write_request {
 	enum vau_file_operation operation;
 	unsigned yes, recursive, overwrite;
 	uint64_t bytes;
-	char sha256[65], expected_sha256[65]; /* Upload digest; optional old-file precondition (required
+	char sha256[65], expected_sha256[65]; /* Empty upload digest selects size-only verification.
+	                                         Optional old-file precondition (required
 	                                         for tai config). */
 };
 

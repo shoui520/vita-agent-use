@@ -140,7 +140,8 @@ int vau_write_execute(const struct vau_file_policy *policy, const struct vau_wri
 	}
 
 	if (request->operation == VAU_FS_WRITE) {
-		if (request->recursive || request->bytes > INT64_MAX || !digest(request->sha256) ||
+		if (request->recursive || request->bytes > INT64_MAX ||
+		    (*request->sha256 && !digest(request->sha256)) ||
 		    (request->overwrite ? (*request->expected_sha256 && !digest(request->expected_sha256))
 		                        : !!*request->expected_sha256)) {
 			return VAU_INVALID;
@@ -157,6 +158,9 @@ int vau_write_execute(const struct vau_file_policy *policy, const struct vau_wri
 
 	if (vau_path_normalize(request->path, r.path, sizeof(r.path)))
 		return VAU_INVALID;
+	if (r.operation == VAU_FS_WRITE && !r.sha256[0] &&
+	    (config_path(r.path) || r.expected_sha256[0]))
+		return VAU_DENIED;
 	if (r.operation == VAU_FS_RENAME_SOURCE) {
 		if (vau_path_normalize(request->destination, r.destination, sizeof(r.destination)) ||
 		    child(r.destination, r.path) || child(r.path, r.destination)) {

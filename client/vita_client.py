@@ -30,11 +30,34 @@ class ClientError(Exception):
     pass
 
 
+class UploadTransportError(ClientError):
+    """The same durable upload step may be retried after reconnecting."""
+
+
+def upload_wait_timeout(request, action, timeout=20):
+    # Whole-file SHA-256 work is synchronous on the Vita. Commit/recovery may
+    # hash the stage and destination; chunk deadlines remain short and fixed.
+    if action == 'chunk':
+        return timeout
+    if request.get('skip_hash'):
+        return max(timeout,60)
+    passes = 3 if action in ('commit', 'recover') else 1
+    return max(timeout, min(3600, 60 + passes * int(request['bytes']) / (1024 * 1024)))
+
+
+def connection_setup_hint():
+    return ('Check VITA_AGENT_CONFIG_DIR points to the intended directory containing config.json, '
+            'and check device_dir (or explicit credentials/state paths) selects the intended pc/ identity. '
+            'Different identity directories can contain different PC certificates; existing certificate files alone do not prove pairing. '
+            'Reuse the intended paired identity. Run session pair and tap OK on the Vita once for a new identity. '
+            'Keep existing identity files, credentials and recovery state; do not regenerate or delete them.')
+
+
 def connection_refused_message():
-    return ('Vita refused the connection. It may still hold an active session from this PC after serve stopped. '
+    return ('Vita connection was refused. '+connection_setup_hint()+' '
+            'It may still hold an active session from this PC after serve stopped. '
             'Start serve to reuse the saved session, or wait for that session to expire. '
-            'Also check the Vita is awake, its IP is correct, and the plugin is running. '
-            'Keep the saved identity, credentials and recovery state.')
+            'Also check the Vita is awake, its IP is correct, and the plugin is running.')
 
 
 def screen_off_if_idle(client):
@@ -510,6 +533,13 @@ class VitaClient:
         except ConnectionRefusedError as exc:
             connection.close()
             raise ConnectionRefusedError(connection_refused_message()) from exc
+        except TimeoutError as exc:
+            connection.close()
+            raise TimeoutError('Vita connection timed out. '+connection_setup_hint()+
+                               ' Also check the Vita IP, connectivity and whether another serve owns the connection.') from exc
+        except ssl.SSLError as exc:
+            connection.close()
+            raise ssl.SSLError(str(exc)+' '+connection_setup_hint()) from exc
         except BaseException:
             connection.close()
             raise
@@ -706,16 +736,23 @@ class VitaClient:
             self._upload_chunk_bytes=limit
         return self._upload_chunk_bytes
 
-    def upload_step(self, request, action, offset=0, data=b''):
+    def upload_skip_hash_supported(self):
+        reply=self.call('capabilities')
+        if reply.get('status')!='ok':raise ClientError('Cannot query upload capabilities.')
+        return reply.get('result',{}).get('upload',{}).get('skip_hash') is True
+
+    def upload_step(self, request, action, offset=0, data=b'', *, progress=None):
         """One sequential upload step; workflow must persist request first."""
         fields = {'operation_id', 'path', 'bytes', 'sha256', 'expected_sha256', 'overwrite', 'yes'}
         actions = ('begin', 'chunk', 'verify', 'commit', 'recover')
-        if not isinstance(request, dict) or set(request) != fields or action not in actions:
+        if not isinstance(request, dict) or set(request) not in (fields,fields|{'skip_hash'}) or action not in actions:
             raise ClientError('Invalid upload metadata.')
+        skip_hash=request.get('skip_hash',False)
+        if type(skip_hash) is not bool:raise ClientError('Invalid skip_hash flag.')
         self._command('fs.mkdir', {key: request[key] for key in ('operation_id', 'path', 'yes')})
         if type(request['overwrite']) is not bool or not isinstance(request['bytes'], str) or not re.fullmatch('0|[1-9][0-9]{0,18}', request['bytes']) or int(request['bytes']) > 2**63-1:
             raise ClientError('Invalid upload size or overwrite flag.')
-        if not isinstance(request['sha256'], str) or not re.fullmatch('[0-9a-f]{64}', request['sha256']) or not isinstance(request['expected_sha256'], str) or not re.fullmatch('(?:[0-9a-f]{64})?' if request['overwrite'] else '', request['expected_sha256']):
+        if not isinstance(request['sha256'], str) or not re.fullmatch('' if skip_hash else '[0-9a-f]{64}', request['sha256']) or not isinstance(request['expected_sha256'], str) or not re.fullmatch('(?:[0-9a-f]{64})?' if request['overwrite'] and not skip_hash else '', request['expected_sha256']):
             raise ClientError('Invalid upload content digest.')
         if type(offset) is not int or offset < 0 or not isinstance(data, bytes) or len(data) > 122880:
             raise ClientError('Invalid upload chunk.')
@@ -733,6 +770,7 @@ class VitaClient:
         with self._locked_state() as state:
             if state['pending'] is not None:
                 raise ClientError('Recover the pending command before uploading.')
+            wait_sock = None
             try:
                 connection = self._connection
                 if connection is None or connection.sock is None:
@@ -741,13 +779,22 @@ class VitaClient:
                 connection.request('POST', '/v1/file/upload', body=payload, headers={
                     'Content-Type': 'application/octet-stream', 'Authorization': 'Bearer ' + self.token,
                     'Connection': 'keep-alive'})
-                response = connection.getresponse()
+                wait_timeout = upload_wait_timeout(request, action, self.timeout)
+                if hasattr(connection, 'getresponse_wait'):
+                    response = connection.getresponse_wait(wait_timeout, progress)
+                else:
+                    wait_sock = connection.sock
+                    previous_timeout = wait_sock.gettimeout()
+                    wait_sock.settimeout(wait_timeout)
+                    response = connection.getresponse()
                 lengths = response.headers.get_all('Content-Length', [])
                 if response.headers.get_all('Transfer-Encoding') or response.headers.get_all('Content-Encoding'):
                     raise ClientError('Unsupported upload response framing.')
                 if len(lengths) != 1 or not re.fullmatch('[0-9]+', lengths[0]) or not 0 < int(lengths[0]) <= 2048:
                     raise ClientError('Invalid upload response length.')
                 raw = response.read(int(lengths[0]) + 1)
+                if response.status == 401:
+                    raise UploadTransportError('Upload session expired or was revoked; reconnect with the saved identity and retain the transfer state.')
                 if len(raw) != int(lengths[0]) or response.status != 200 or response.headers.get('Content-Type', '').lower() != 'application/json':
                     raise ClientError('Upload response rejected or truncated (HTTP %d).' % response.status)
                 result = strict_json(raw)
@@ -771,10 +818,13 @@ class VitaClient:
                 return result
             except (OSError, http.client.HTTPException, ValueError) as exc:
                 self._close_transport()
-                raise ClientError('Upload transport failed (%s: %s); resume using the saved transfer state.' % (type(exc).__name__,str(exc) or type(exc).__name__)) from exc
+                raise UploadTransportError('Upload transport failed (%s: %s); resume using the saved transfer state.' % (type(exc).__name__,str(exc) or type(exc).__name__)) from exc
             except BaseException:
                 self._close_transport()
                 raise
+            finally:
+                if wait_sock is not None and connection.sock is wait_sock:
+                    wait_sock.settimeout(previous_timeout)
 
     def audit_page(self, after=0):
         """Read bounded journal events without changing the device journal."""
