@@ -121,6 +121,14 @@ python3 client/vita_agent.py app list
 python3 client/vita_agent.py --help
 ```
 
+File uploads use SHA-256 verification by default. For large files, `--skip-hash` avoids hashing on both the PC and the Vita and checks file sizes instead:
+
+```sh
+./vita-agent fs upload ./data.bin ux0:data/data.bin --transfer-state ./agent/data-upload.json --skip-hash
+```
+
+Successful size-only uploads report `complete: true`, `verified: false`, `hash_verified: false` and `verification: "size_only"`. Permissions, staged commit and audit logging still apply. The option cannot be used for guarded `tai/config.txt` edits or with `--expected-sha256`. To resume, rerun the same command with the same source, flags and transfer-state file. See the [upload examples](docs/agent-reference/formats.md#upload-replace-install).
+
 ## Companion tools
 
 The agent can also use these tools when profiling or debugging:

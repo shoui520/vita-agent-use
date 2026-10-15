@@ -97,6 +97,30 @@ python3 client/vita_agent.py fs download ux0:data/my-app/data.bin ./private-work
 
 To replace an executable: `app close EXAMPLE01`, optionally back it up with `fs download`, then `fs upload ... --overwrite --yes --transfer-state ...`, read it back and compare, then `app launch`. No ACL is needed for ordinary paths. `--expected-sha256` takes the **old** file's hash, never the new source's.
 
+For large ordinary files, add `--skip-hash` to avoid hashing the contents on either the PC or Vita:
+
+```sh
+./vita-agent fs upload ./data.bin ux0:data/data.bin --transfer-state ./agent/data-upload.json --skip-hash
+```
+
+The Vita checks the staged size and committed size, but does not compare a content digest. Permissions, sequential synced chunks, overwrite requirements, journaled commit and audit logging still apply. The matching Shell plugin must advertise support; an older plugin is rejected before upload begins. This option cannot be combined with `--expected-sha256` or used for guarded `tai/config.txt` edits.
+
+Relevant completion fields for a successful size-only upload are:
+
+```json
+{
+  "code": 0,
+  "complete": true,
+  "verified": false,
+  "hash_verified": false,
+  "verification": "size_only"
+}
+```
+
+Here `verified: false` means that content hashing was skipped, not that the commit failed. `complete: true` and `code: 0` confirm completion with size-only checks. To verify the bytes independently, use `fs download` to a new PC file and compare it with the source on the PC.
+
+Resume by rerunning exactly the same command with `--skip-hash`, the same source and the same transfer-state file. Skip mode saves the source's file identity, size and modification metadata; changing or replacing the source causes resume to be rejected. Do not switch an existing hashed transfer to skip mode or vice versa.
+
 To install a VPK, upload it to the Vita first, then:
 
 ```sh
