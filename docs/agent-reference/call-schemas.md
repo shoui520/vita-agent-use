@@ -7,7 +7,7 @@ python3 client/vita_agent.py call performance.read --args '{"after":0}'
 python3 client/vita_agent.py call log.start --args '{"path":"ux0:data/my-app/log.txt","marker":"frames=1000"}'
 ```
 
-Conventions: `ID` is 32 lowercase hex characters. Title IDs are 9 uppercase alphanumeric characters. Paths are Vita paths of at most about 511 UTF-8 bytes. Counter strings are canonical non-negative decimals that fit in signed 64-bit; positive scopes and media IDs cannot be `"0"`. Event cursors are uint32. Unknown arguments are rejected. Native replies are at most 4 KiB, and the last response on each authenticated connection is cached for replay.
+Conventions: `ID` is 32 lowercase hex characters. Title IDs are 9 uppercase alphanumeric characters. Paths are Vita paths of at most about 511 UTF-8 bytes. Counter strings are canonical non-negative decimals that fit in signed 64-bit; positive scopes and media IDs cannot be `"0"`. Event cursors are uint32. Unknown arguments are rejected. Native replies are at most 4 KiB, and the last response of each session is cached for replay; the client replays a lost reply under its original ID by itself.
 
 | Operation | Args and notes |
 |---|---|
@@ -37,6 +37,8 @@ Conventions: `ID` is 32 lowercase hex characters. Title IDs are 9 uppercase alph
 | `performance.cancel`, `events.start`, `events.stop`, `dialog.events.start`, `dialog.events.stop` | `{}`. `events.stop` leaves the default crash listener on. |
 | `events.read`, `dialog.events.read` | `{after}` |
 | `events.subscribe` | `{}`. Owned by the server; never call it behind a running server. |
+| `session.ping` | `{}`. Returns `now_us`. Keeps the connection and session alive without waking the display; repeatable. |
+| `session.extend` | `{}`. Extends the current token to a full lifetime from now (`lifetime_us`, `expires_us`), keeping its replay cache and watches. The server does this by itself before expiry. |
 | `log.start` | `{path, marker}`. Literal of 1..128 bytes; starts at the end of the file. |
 | `log.read` / `log.stop` | `{watch_id}`, a positive uint32 |
 | `livearea.schema` | Optional `{after}`. Omit for the complete metadata. |

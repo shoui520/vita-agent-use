@@ -11,11 +11,24 @@ python3 client/vita_agent.py server watch-log ux0:data/my-app/log.txt --literal 
 python3 client/vita_agent.py server performance-start --seconds 60 --interval-ms 1000
 ```
 
-`--wait` waits on the PC's own event history; it does not poll the Vita. The Vita pushes events over the server's existing connection, so nothing extra listens on the network. The Unix socket is only for local CLI calls. Reconnects back off from 2 to 60 s. Background reconnect, saved-PC token renewal and event subscription remain silent with the screen off; they do not show the agent-use notification. Actual commands still wake the display and announce use. An uncertain write or control command pauses automatic reconnection until it is recovered; read-only observations do not. With `device_dir` configured, sessions renew before the one-hour expiry or idle limit. `server status` includes expiry and reports expired sessions as disconnected. Legacy credentials without a recorded expiry are renewed once when the saved pairing directory is available. Renewal is deferred during runs and dump finalization. Renewal interrupts standalone log listeners and emits `log.interrupted`; re-register them.
+`--wait` waits on the PC's own event history; it does not poll the Vita. The Vita pushes events over the server's existing connection, so nothing extra listens on the network. The Unix socket is only for local CLI calls. Background reconnect, heartbeats, session extension, saved-PC token renewal and event subscription remain silent with the screen off; they do not show the agent-use notification. Actual commands still wake the display and announce use.
+
+The server keeps its connection alive by itself:
+
+- After 15 s without traffic it sends a background `session.ping`, so the 30-minute idle limit never closes a served connection.
+- Ten minutes before the one-hour expiry it calls `session.extend`, which keeps the same token, replay cache and watches. Plugins without it are renewed from the saved pairing while idle, two minutes before expiry; this needs `device_dir`.
+- A lost connection is reconnected with a backoff of at most 15 s. A connection that returns within the plugin's 5-minute grace (`features.connection_grace_us`) resumes the same session: watches, pushed performance and the run carry on, with `connection.ready` `resumed: true`.
+- When the Vita no longer holds the session (reboot, expiry, plugin restart, a new admission), the server renews it from the saved pairing, emits `session.renewed`, re-subscribes, re-arms log watches under their original `watch_id` (`log.resumed`, from the end of the file; bytes written in the gap are not replayed) and restarts server-started performance recording. A watch that cannot be re-armed emits `log.interrupted`.
+- A pending command never blocks reconnection: it is replayed with its original ID, or recorded as unresolved if its session ended (`command.recovered` / `command.unresolved` events).
+
+`server status` reports `connected`, `connection_error`, `session`, `features`, `reconnects` and recent `unresolved` records. Expired sessions show as disconnected.
 
 | Event | Meaning |
 |---|---|
-| `connection.ready` / `connection.lost` | Connection lifecycle. Lost does not mean effects were undone. |
+| `connection.ready` / `connection.lost` | Connection lifecycle. Lost does not mean effects were undone. `ready` carries `resumed` and `session_renewed`. |
+| `session.renewed` | The server obtained a new session from the saved pairing; the old session's watches were re-armed. |
+| `command.recovered` / `command.unresolved` | A lost reply was recovered with its original ID (`reply`), or could not be because its session ended (`instruction`; also in `pc/unresolved.jsonl`). |
+| `log.resumed` / `log.interrupted` | A log watch was re-armed under its original `watch_id` after a new session, or could not be. |
 | `coredump.saving` | A new `.psp2dmp.tmp` appeared. Record it and wait. |
 | `coredump.complete` | Renamed to the final `.psp2dmp`. Match it to the saving event and keep the full path. |
 | `dialog.error` | Error callback. Keep the code/hex; it does not prove a dialog was shown. |
@@ -36,7 +49,7 @@ TTY records are fragments, not guaranteed full lines. The kernel keeps 32 record
 
 Keep the hex `data` to preserve arbitrary bytes. `text` decodes each fragment as UTF-8 with replacement, so a multibyte character split across records can appear incorrectly in the preview; decode consecutive data fragments on the PC when exact text matters. Long kernel printf calls retain the first 1,023 bytes. TTY `events.overflow` reports `lost` records and `dropped_since_last` bytes omitted through truncation or lock contention. Heavy logging can overflow the ring; capture never blocks the producer waiting for the PC. TTY receipt does not wake the screen or mark the agent as active.
 
-Log watches match an exact UTF-8 literal of 1–128 bytes (no regex) and start at the end of the file. They ignore older matches and allow a file that will be created later. There are 4 slots; free any you no longer need, and re-arm them after a reconnect. `--once` frees its slot after the first match; it does not end a run or close the app.
+Log watches match an exact UTF-8 literal of 1–128 bytes (no regex) and start at the end of the file. They ignore older matches and allow a file that will be created later. There are 4 slots; free any you no longer need. The server re-arms them after a new session; check for `log.resumed` and `log.interrupted`. `--once` frees its slot after the first match; it does not end a run or close the app.
 
 ## Runs
 
@@ -65,7 +78,7 @@ python3 client/vita_agent.py run status
   - `{"upload": {"source": "./build/eboot.bin", "destination": "ux0:app/EXAMPLE01/eboot.bin", "overwrite": true}}` uses the guarded staged upload.
   - `{"install": {"source": "./build/example.vpk"}}` stages, installs and checks the installed title matches.
 
-Without `completion`, the run waits for cancel, a coredump, a disconnect or the timeout.
+Without `completion`, the run waits for cancel, a coredump, a lost session or the timeout. A connection that drops and returns within 90 s (and within the plugin's grace) does not end a run; a new session ends it as `connection_lost`.
 
 ## Crash tests
 

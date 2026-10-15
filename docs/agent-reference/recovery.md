@@ -2,6 +2,28 @@
 
 Keep the complete JSON error and the related operation and run IDs. State whether the request was sent, accepted, started its effect, and completed or passed readback.
 
+## What the client recovers by itself
+
+Every command, direct or under `serve`, keeps trying for up to 90 s from its first failure before it reports one. Within that window it:
+
+- reconnects after a reset, a timeout or a Vita that went away (TCP keepalive notices a vanished peer in about 40 s);
+- waits out HTTP 503 (`"retry":true`, the command service is momentarily busy) and a command port that is still starting after a new token;
+- renews the session from the saved pairing when the Vita answers 401 or refuses the command port (expiry, reboot, plugin restart); this needs `device_dir` in the config;
+- resends a request that provably never ran (not sent, refused, 401, 503, or a parse rejection with `"id":null`);
+- replays a request whose reply was lost under its original ID. The Vita answers from its one-reply replay cache and does not run it again.
+
+When an earlier command's reply was lost and is recovered before the next one runs, the next result carries a `command.recovered` notice with that `reply`. Read it: it is the real outcome of the earlier command.
+
+A lost reply cannot be replayed once the session that ran it ends. The client then:
+
+- writes the request to `pc/unresolved.jsonl` (next to `state.json`) with its `id`, `op`, `args`, `reason` and an `instruction`;
+- never resends it by itself;
+- returns `unconfirmed` with an `unresolved` record if it was the current command, or attaches a `command.unresolved` notice to the next result;
+- lists recent records in `server status` (`unresolved`) and in `session recover` (`unresolved_recent`);
+- carries on with new commands.
+
+The `instruction` depends on the operation. Filesystem writes, `app install`, `decrypt start`, `acl request` and content-delete requests are deduplicated on the Vita by their operation/request ID, so repeating the identical command with the same ID returns the recorded outcome instead of acting twice. Session-bound requests (watches, input leases, performance recording, runs) ended with their session; issue them again if they are still needed. For anything else (input, app launch/close, screen and similar control), check the resulting state before repeating it. Reads are never recorded; they are simply sent again.
+
 ## Native wrapper codes
 
 | Code | Symbol | Recovery |
@@ -23,32 +45,35 @@ Large negative numbers are Sony codes, not these. Keep both the signed decimal a
 
 | Symptom | Action |
 |---|---|
-| Missing config, or wrong Vita or name | Check `VITA_AGENT_CONFIG_DIR`, its `config.json`, and file permissions. It must be an absolute directory containing the intended config and `pc/`. Export it in the agent/server process environment. Old pointer files are unsupported; select the directory containing the actual config. Never copy the client once per Vita. |
-| Private JSON rejected | It must be a regular, user-owned file (`chmod 600`); check its shape, size and duplicate keys. Never loosen the checks. |
+| Missing config, or wrong Vita or name | Check `VITA_AGENT_CONFIG_DIR` and its `config.json`. It must name the directory containing the intended config and `pc/`; when unset, only this checkout's `agent/vita-agent-use/` is tried. Export it in the agent/server process environment. Old pointer files are unsupported; select the directory containing the actual config. Never copy the client once per Vita. |
+| Private JSON rejected | Loose permissions are tightened automatically. A rejection means the file is a symlink, not a regular file, owned by another user, too large, or not valid JSON of the expected shape (duplicate keys included). Fix the file; never loosen the checks. |
 | `bootstrap` fails for the agent | It needs a human at a terminal. |
-| Server socket missing | Start `serve` with the same state directory. |
-| Socket exists but connection refused | This is the local PC socket, not evidence that the Vita rejected a connection. Check `VITA_AGENT_CONFIG_DIR` selects the intended config/identity directory. An unclean exit can leave a stale socket. Confirm no process owns the lock, then restart `serve` with that same config (it removes the stale socket). Never start duplicates or delete live state. |
-| `connected:false`, refused Vita connection, or connection timeout | Keep `connection_error`. Check `VITA_AGENT_CONFIG_DIR`, `config.json` and its `device_dir` (or explicit credentials/state paths) select the intended PC identity. Certificates existing under `pc/` do not prove that identity was paired. Reuse the intended approved identity, or run `session pair` and have the human tap OK once for a new identity. Also check the network and IP, run one diagnostics query, and inspect the grant and any pending command. Do not regenerate identities or delete recovery state. |
+| Server socket missing | Commands run directly. Start `serve` with the same config when you need pushed events or runs. |
+| Stale server socket after a crash | Commands notice that no `serve` holds the lock and run directly. Restart `serve` with the same config; it replaces the socket. Never start duplicates or delete live state. |
+| `connected:false` in `server status` | The server keeps reconnecting by itself with a backoff of at most 15 s; read `connection_error`. A command sent now also tries for up to 90 s. If it persists, check the Vita is awake and on Wi-Fi, `vita_ip`, and that `VITA_AGENT_CONFIG_DIR` and `device_dir` select the intended, paired PC identity (certificates under `pc/` do not prove pairing). Run one diagnostics query. Do not regenerate identities or delete recovery state. |
+| Command fails after "Kept retrying for N s." | The Vita stayed unreachable or kept refusing for the whole window. The message says what failed last, including any renewal error. Fix that cause (network, IP, plugin not running, identity not paired), then rerun the same command; a request that might have run is replayed under its original ID first. |
 | 8847 refused but 8848 active | This can occur on older builds. The multi-identity build keeps admission listening. Finish work and stop the current `serve` before switching identities; keep credentials and recovery state. |
-| Command port refused right after reconnect or reboot | The listener isn't ready yet. Let the existing readiness/reconnect logic handle it; do not hammer the port. |
-| Wi-Fi disabled/re-enabled during a session | Keep the same identity and recovery state. `serve` reconnects automatically; the next remote command also attempts reconnect before screen access. Interrupted observations/subscriptions can renew automatically. An uncertain effect still requires `session recover`, which replays the exact request without sending screen commands first. Resume interrupted uploads with the original transfer state after recovery. A failed native listener is closed and reopened; rebooting or pairing again is not the normal recovery path. |
-| Timeout, reset or truncated response | The command may have run. Recover the exact pending request before doing anything else with effects; check the journal, diagnostics and current task. |
+| Command port refused | Handled automatically: right after a new token, or within 10 s of a dropped connection (the plugin reopening its listener after a network reset), the client waits for the listener; otherwise the session is gone (reboot, expiry, plugin restart) and it is renewed from the saved pairing. |
+| Wi-Fi disabled/re-enabled or the Vita slept | Nothing to do if it returns within 90 s: the command in flight reconnects and replays, `serve` reconnects and resumes its watches. With a plugin that keeps session state, the session survives a Wi-Fi reconnect (the plugin reopens its listeners after `SCE_NET_ERROR_EIPADDRCHANGED`), and watches, performance recording and runs survive a gap of up to 5 minutes; a longer gap re-arms watches (`log.resumed`). Its `runtime.log` shows `command network reset` and `commands listening again`. Keep the same identity and recovery state; rebooting or pairing again is not the normal recovery path. |
+| Timeout, reset or truncated response | Handled automatically by exact-ID replay. If the result is `unconfirmed` with `unresolved`, follow its `instruction`. |
 | TLS unknown CA during pairing/session connect | This PC certificate was rejected. Older Shell builds accept only one peer; update to the multi-identity build and use `session pair` for each new identity. Do not delete existing trust. A rejected handshake cannot expose the trusted peer name/fingerprint. |
 | TLS pin mismatch | Stop. Check whether the IP or device is wrong, or the identity was deliberately reset. Never disable pinning or send tokens to the unexpected device. Re-pair only as a deliberate reset with human approval. |
-| HTTP 401 or expired grant | Normal expiry: `session connect` or a server reconnect. If the human stopped access, respect that. |
-| Failed read-only request under `serve` | The server can recover observations automatically; snapshots and filesystem/app listings or stats retry once after renewing a lost session. If renewal fails, keep the error and state and retry after `server status` becomes connected. Writes/input/app control are never automatically resubmitted with a new ID. |
-| "An uncertain command is pending" | `session recover`. Never delete `state.json`, edit counters or create a new ID. |
-| Recovery fails after a new session or reboot | Replay is cached for only one response. Reconcile using the native app, install, ACL or content status, or the upload and audit records, before any new operation. |
+| HTTP 401 or expired grant | Renewed automatically from the saved pairing. Without `device_dir`, run `session connect`. If the human stopped access, respect that. |
+| HTTP 503 | The command service was momentarily busy and nothing ran; the client waits and resends. |
+| `command.recovered` notice | An earlier command's lost reply arrived late. Use its `reply` as that command's outcome. |
+| `unconfirmed` with `unresolved`, or a `command.unresolved` notice | The session ended before the reply could be replayed. Follow the record's `instruction`; check the resulting state before repeating anything that is not deduplicated. Never delete `state.json` or `unresolved.jsonl`, edit counters or mint a new ID for a deduplicated operation. |
+| `session recover` | Rarely needed: commands settle a pending request first. It replays one now, or returns the last reply, or reports that nothing is pending together with recent unresolved records. |
 | PS+SELECT / "Agent stopped." | Stop. Keep pending effects and wait for the user. An old lease never resumes by itself. |
 | Screen off | Normal access wakes it. Check the evidence before blaming the display. |
-| `frame_unavailable` | Report it. Wait about 2 s after a launch or wake, then capture to a new filename. Never fake a frame. |
-| Output path already exists | Use a new path; the tool will not overwrite. Never delete unrelated files. |
+| `frame_unavailable` | Captures retry for 3 s by themselves. If it persists, report it; wait about 2 s after a launch or wake and capture again. Never fake a frame. |
+| Output path already exists | Captures and downloads replace an existing file atomically and report `replaced:true`. Directories and symlinks are refused; choose another path. |
 | Launch accepted but wrong or no title in foreground | Unconfirmed. Check `app running`, the snapshot, dialog events and a capture, and handle any dialog with the user. Never bypass the confirmation. |
 | VPK still installing | Query the same ID. Never start overlapping installs or free resources the installer is using. |
 | ACL pending or denied | Wait for the physical decision and query the same ID. Only `approved` grants access. |
 | Write denied despite ACL | Check the immutable and core-plugin rules, the private storage and tai-root rules, which tai directory is active, narrower denies, and `--yes`. |
 | Original-hash mismatch | The target changed. Keep the old plan and make a fresh one; never force it. |
-| Interrupted upload | Read the error’s `result` for phase/action, last confirmed `received` bytes, total bytes, operation ID and transfer-state path. Unacknowledged bytes may also exist on the Vita; resume queries its confirmed offset. Rerun exactly the same command with the same state file, source, config and flags. Never change the source mid-upload. |
+| Interrupted upload | A connection lost mid-upload is resumed from the Vita's confirmed offset within the same command. If the 90 s window runs out, read the error’s `result` for phase/action, last confirmed `received` bytes, total bytes, operation ID and transfer-state path, then rerun exactly the same command with the same state file, source, config and flags. Never change the source mid-upload. |
+| Transfer state from a finished upload | A state file whose upload completed is reused for a new, different upload automatically. Only an unfinished one must match the source, device and options. |
 | Upload succeeds with `verified:false` | With `--skip-hash`, `code:0`, `complete:true`, `hash_verified:false` and `verification:"size_only"` mean a completed upload checked by size, without content hashing. Do not describe it as hash-verified. Download and compare on the PC if content verification is needed. |
 | Skip-hash transfer state rejected | Keep the saved state and operation ID. Check that the source was not modified or replaced and that the same `--skip-hash` mode and other flags are used. Hashed and size-only transfers cannot share an operation/state file. An older plugin needs updating before it can accept skip mode. |
 | Config guard or prerequisite failure | Leave the config alone. Check the host guard, protected lines, which tai directory is active and the recovery VitaShell. |
@@ -58,7 +83,7 @@ Large negative numbers are Sony codes, not these. Keep both the signed decimal a
 | Run failed with `coredump` | Check the path, the terminal state and `cleanup_errors`. This can be a correct result. |
 | Log literal never arrives | The watch started at the end of the file. Check the exact bytes, the path, whether the app launched and flushed its log, and reset, connection or overflow events. Never match an old line. |
 | Metrics null, wrong process or dropped | Keep the error, foreground-process and window evidence; never invent values. |
-| IPC timeout after 65 s of silence | Upload progress resets this inactivity limit; total upload duration is not capped at 65 s. The job may still be running. Check events and status before resubmitting. Prefer the asynchronous interfaces. |
+| IPC timeout after 65 s of silence | The server sends a keepalive every 10 s while a command runs, so this means the server itself is stuck. The job may still be running. Check `server status` and events before resubmitting; restart `serve` if it does not answer. |
 | IPC reply over 1 MiB | Use `--limit` and handle `has_more` (`livearea layout` needs `--section` first). Say the result is limited. |
 | Event `lost` or overflow | Report the gap and check the journal. Events lost on the Vita cannot be recovered. |
 | Audit sync fails | Keep the mirror and its cursor, and retry into the same mirror. Never reset native journals. |
@@ -72,9 +97,9 @@ The Vita retains every physically approved identity in `ur0:data/vita-agent-use/
 1. Finish the current controller's work, wait for dumps to finalize, and stop its `serve` process gracefully. One controller owns the command connection at a time; approving many identities does not allow competing input streams.
 2. Select the new identity's config using `VITA_AGENT_CONFIG_DIR`, then run `session pair`. Bootstrap/provision creates its private PC files if needed.
 3. Compare the fingerprint and tap OK once. Cancel, timeout or a failed write never replaces or deletes another identity's trust.
-4. Start `serve`. For later visits, select this config and use `session connect` or `serve`; repeating `session pair` for an approved identity also reconnects without prompting again.
+4. Start `serve`. For later visits, select this config and start `serve` or run commands directly; they connect from the saved pairing. Repeating `session pair` for an approved identity also reconnects without prompting again.
 
-The admission port stays listening while commands are served. Requests wait for the active connection and native content/install work to finish; after stopping the old server, they proceed without rebooting or waiting an hour for expiry. A timeout can mean another server still owns the connection; it is not evidence that pairing files must be deleted. An unknown identity using `session connect` receives `identity_not_paired` and instructions to pair once.
+The admission port stays listening while commands are served. Requests wait for the active connection and native content/install work to finish; after stopping the old server, they proceed without rebooting or waiting an hour for expiry. A timeout can mean another server still owns the connection; it is not evidence that pairing files must be deleted. A request whose PC gave up while waiting (queued for more than 80 s) is dropped instead of ending the current session. An unknown identity using `session connect` receives `identity_not_paired` and instructions to pair once.
 
 Each approval is saved through a synced temporary file and rename, then read back before the token reply. A partial `.tmp` is never trusted. Previously approved PCs retain their ACLs; new identities must separately request protected-path access. Keep each config's `pc/` files together; changing directories does not transfer an identity.
 
