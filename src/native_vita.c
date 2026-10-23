@@ -225,13 +225,20 @@ static int capture_frame(void *context, struct vau_frame *out)
 			return rc;
 	}
 
-	return vau_frames_capture(&frames, out);
+	int rc = vau_frames_capture(&frames, out);
+
+	if (rc < 0)
+		(void)vau_frames_end(&frames);
+	return rc;
 }
 
+/* Shell has only a few MiB to spare: hold the 2 MiB JPEG buffer only while a
+ * frame is in flight, at the cost of allocating it for every capture. */
 static void release_frame(void *context)
 {
 	(void)context;
 	vau_frames_release(&frames);
+	(void)vau_frames_end(&frames);
 }
 
 int vau_vita_frames_end(void)

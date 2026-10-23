@@ -176,10 +176,7 @@ static int parse_touch(const char *json, const struct vau_json_token *t, size_t 
 		if (*count >= VAU_MAX_EVENTS || t[state].type != VAU_JSON_ARRAY)
 			return VAU_INVALID;
 
-		VauTouchState *touch = &out->touch[(*count)++];
-
-		memset(touch, 0, sizeof(*touch));
-
+		VauTouchState entry = { 0 }, *touch = &entry;
 		uint64_t enabled;
 		size_t field = state + 1;
 
@@ -228,6 +225,11 @@ static int parse_touch(const char *json, const struct vau_json_token *t, size_t 
 
 		if (field != t[state].next)
 			return VAU_INVALID;
+
+		int rc = vau_input_stream_put(&out->stream, VAU_STAGE_TOUCH, (*count)++, touch);
+
+		if (rc < 0)
+			return rc;
 	}
 
 	return next < 0 ? VAU_INVALID : VAU_OK;
@@ -256,13 +258,19 @@ static int parse_sequence(const char *json, const struct vau_json_token *t, size
 			bit = 16;
 			if (t[v].type != VAU_JSON_ARRAY)
 				return VAU_INVALID;
-			if (vau_input_events_parse(json, t, v, out) < 0)
-				return VAU_INVALID;
+
+			int rc = vau_input_events_parse(json, t, v, out);
+
+			if (rc < 0)
+				return rc;
 		} else if (!strcmp(key, "touch")) {
 			bit            = 32;
 			out->has_touch = 1;
-			if (parse_touch(json, t, v, out, &touch_count) < 0)
-				return VAU_INVALID;
+
+			int rc = parse_touch(json, t, v, out, &touch_count);
+
+			if (rc < 0)
+				return rc;
 		} else if (!strcmp(key, "start_delay_us")) {
 			bit = 1;
 
@@ -313,12 +321,12 @@ static int parse_sequence(const char *json, const struct vau_json_token *t, size
 	    ((seen & 32u) && (out->readable_input || touch_count != s->count)) || !s->count ||
 	    !s->duration_us || s->duration_us > VAU_MAX_DURATION_US || !s->repeats ||
 	    s->repeats > VAU_MAX_REPEATS || !s->max_lateness_us || s->max_lateness_us > 1000000u ||
-	    out->events[s->count - 1].at_us >= s->duration_us ||
+	    out->last_at_us >= s->duration_us ||
 	    s->start_us > UINT64_MAX - (uint64_t)s->duration_us * s->repeats) {
 		return VAU_INVALID;
 	}
 
-	return VAU_OK;
+	return vau_input_stream_finish(&out->stream, out->staged_digest);
 }
 
 static int content_counter(const char *json, const struct vau_json_token *token, uint64_t *out)
@@ -333,13 +341,17 @@ static int content_counter(const char *json, const struct vau_json_token *token,
 	return vau_json_u64(text, &number, out) || *out > INT64_MAX ? VAU_INVALID : VAU_OK;
 }
 
-static int parse(const char *json, size_t length, struct vau_command *out, struct vau_json_token *t)
+/* api supplies where input sequences are staged; without one they fail to parse. */
+static int parse(const char *json, size_t length, struct vau_command *out, struct vau_json_token *t,
+                 const struct vau_native_api *api)
 {
 	size_t count;
 	unsigned seen = 0;
 	size_t args   = 0;
 
-	memset(out, 0, offsetof(struct vau_command, touch));
+	memset(out, 0, offsetof(struct vau_command, stream));
+	vau_input_stream_init(&out->stream, api ? api->input_context : NULL,
+	                      api ? api->input_stage : NULL);
 	if (length > VAU_REQUEST_BYTES ||
 	    vau_json_parse_command(json, length, t, VAU_COMMAND_TOKENS, &count) ||
 	    t[0].type != VAU_JSON_OBJECT) {
@@ -1327,14 +1339,11 @@ static void command_digest(const struct vau_command *command, unsigned char dige
 
 	vau_sha256_init(&hash);
 
-	/* The header is zero-initialized on every parse, including padding. Hash
-	 * only populated array entries, never unused or stale workspace bytes.
-	 * Decoded commands retain equivalent-key-order/Unicode retry behavior. */
-	vau_sha256_update(&hash, command, offsetof(struct vau_command, events));
-	vau_sha256_update(&hash, command->events, command->sequence.count * sizeof(*command->events));
-	vau_sha256_update(&hash, &command->has_touch, sizeof(command->has_touch));
-	if (command->has_touch)
-		vau_sha256_update(&hash, command->touch, command->sequence.count * sizeof(*command->touch));
+	/* The header is zero-initialized on every parse, including padding. Staged
+	 * entries count through their digests, taken as they were staged, never
+	 * unused or stale chunk bytes. Decoded commands retain
+	 * equivalent-key-order/Unicode retry behavior. */
+	vau_sha256_update(&hash, command, offsetof(struct vau_command, stream));
 	vau_sha256_finish(&hash, digest);
 }
 
@@ -1347,7 +1356,7 @@ static int request_locked(struct vau_session *s, const struct vau_native_api *ap
 	s->reboot_reply = 0;
 
 	struct vau_command *command = &workspace.command;
-	int rc                      = parse(request, length, command, workspace.tokens);
+	int rc                      = parse(request, length, command, workspace.tokens, api);
 
 	if (rc < 0)
 		return error_reply(response, capacity, "null", rc);
@@ -1760,8 +1769,7 @@ static int request_locked(struct vau_session *s, const struct vau_native_api *ap
 
 		rc = api->input_enqueue
 		             ? api->input_enqueue(api->input_context, s->handle, &command->sequence,
-		                                  command->events,
-		                                  command->has_touch ? command->touch : NULL, &execution)
+		                                  command->has_touch, &execution)
 		             : VAU_UNSUPPORTED;
 		if (rc < 0) {
 			n = error_reply(response, capacity, id, rc);
@@ -1792,14 +1800,13 @@ static int request_locked(struct vau_session *s, const struct vau_native_api *ap
 
 		if (rc < 0) { /* No submit on clock overflow. */
 		} else if (command->has_touch) {
-			rc = api->input_submit_touch
-			             ? api->input_submit_touch(api->input_context, s->handle, &scheduled,
-			                                       command->events, command->touch, &execution)
-			             : VAU_UNSUPPORTED;
+			rc = api->input_submit_touch ? api->input_submit_touch(api->input_context, s->handle,
+			                                                       &scheduled, &execution)
+			                             : VAU_UNSUPPORTED;
 		} else {
-			rc = api->input_submit ? api->input_submit(api->input_context, s->handle, &scheduled,
-			                                           command->events, &execution)
-			                       : VAU_UNSUPPORTED;
+			rc = api->input_submit
+			             ? api->input_submit(api->input_context, s->handle, &scheduled, &execution)
+			             : VAU_UNSUPPORTED;
 		}
 
 		if (rc < 0) {
@@ -2068,7 +2075,7 @@ int vau_protocol_background_request(const char *request, size_t length)
 	if (!request || atomic_flag_test_and_set_explicit(&workspace_busy, memory_order_acquire))
 		return 0;
 
-	int rc             = parse(request, length, &workspace.command, workspace.tokens);
+	int rc             = parse(request, length, &workspace.command, workspace.tokens, NULL);
 	unsigned operation = workspace.command.operation;
 	int background = rc == VAU_OK && (operation == OP_SUBSCRIBE || operation == OP_SESSION_PING ||
 	                                  operation == OP_SESSION_EXTEND);

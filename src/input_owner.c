@@ -24,7 +24,7 @@ static int allowed(const struct vau_auth *auth, uint64_t handle, uint64_t now)
 int vau_input_owner_init(struct vau_input_owner *in, const struct vau_input_bridge *b)
 {
 	if (!in || !b || !b->clock || !b->acquire || !b->heartbeat || !b->submit || !b->cancel ||
-	    !b->release || !b->status) {
+	    !b->release || !b->status || !b->stage) {
 		return VAU_INVALID;
 	}
 
@@ -144,9 +144,18 @@ int vau_input_owner_heartbeat(struct vau_input_owner *in, const struct vau_auth 
 	return rc;
 }
 
+int vau_input_owner_stage(struct vau_input_owner *in, uint32_t kind, uint32_t index, uint32_t count,
+                          const void *entries)
+{
+	if (!in || !in->initialized)
+		return VAU_UNSUPPORTED;
+	if (!entries)
+		return VAU_INVALID;
+	return in->bridge.stage(in->bridge.context, kind, index, count, entries);
+}
+
 static int submit(struct vau_input_owner *in, const struct vau_auth *auth, uint64_t handle,
-                  const VauSequence *sequence, const VauEvent *events, const VauTouchState *touch,
-                  uint64_t *execution_id)
+                  const VauSequence *sequence, int touch, uint64_t *execution_id)
 {
 	if (!execution_id)
 		return VAU_INVALID;
@@ -157,7 +166,7 @@ static int submit(struct vau_input_owner *in, const struct vau_auth *auth, uint6
 
 	if (rc < 0)
 		return rc;
-	if (!sequence || !events || !in->next_sequence)
+	if (!sequence || !in->next_sequence)
 		return VAU_INVALID;
 	if (touch && !in->bridge.submit_touch)
 		return VAU_UNSUPPORTED;
@@ -167,37 +176,29 @@ static int submit(struct vau_input_owner *in, const struct vau_auth *auth, uint6
 	VauSequence native = *sequence;
 
 	native.request_id = in->next_sequence++;
-	rc                = touch ? in->bridge.submit_touch(in->bridge.context, &native, events, touch)
-	                          : in->bridge.submit(in->bridge.context, &native, events);
+	rc                = touch ? in->bridge.submit_touch(in->bridge.context, &native)
+	                          : in->bridge.submit(in->bridge.context, &native);
 	if (rc >= 0)
 		*execution_id = native.request_id;
 	return rc;
 }
 
 int vau_input_owner_submit(struct vau_input_owner *in, const struct vau_auth *auth, uint64_t handle,
-                           const VauSequence *sequence, const VauEvent *events,
-                           uint64_t *execution_id)
+                           const VauSequence *sequence, uint64_t *execution_id)
 {
-	return submit(in, auth, handle, sequence, events, NULL, execution_id);
+	return submit(in, auth, handle, sequence, 0, execution_id);
 }
 
 int vau_input_owner_submit_touch(struct vau_input_owner *in, const struct vau_auth *auth,
                                  uint64_t handle, const VauSequence *sequence,
-                                 const VauEvent *events, const VauTouchState *touch,
                                  uint64_t *execution_id)
 {
-	if (!touch) {
-		if (execution_id)
-			*execution_id = 0;
-		return VAU_INVALID;
-	}
-
-	return submit(in, auth, handle, sequence, events, touch, execution_id);
+	return submit(in, auth, handle, sequence, 1, execution_id);
 }
 
 int vau_input_owner_enqueue(struct vau_input_owner *in, const struct vau_auth *auth,
-                            uint64_t handle, const VauSequence *sequence, const VauEvent *events,
-                            const VauTouchState *touch, uint64_t *execution_id)
+                            uint64_t handle, const VauSequence *sequence, uint32_t has_touch,
+                            uint64_t *execution_id)
 {
 	if (!execution_id)
 		return VAU_INVALID;
@@ -212,13 +213,13 @@ int vau_input_owner_enqueue(struct vau_input_owner *in, const struct vau_auth *a
 		return VAU_DENIED;
 	if (!in->bridge.enqueue)
 		return VAU_UNSUPPORTED;
-	if (!sequence || !events || !in->next_sequence)
+	if (!sequence || !in->next_sequence)
 		return VAU_INVALID;
 
 	VauSequence native = *sequence;
 
 	native.request_id = in->next_sequence++;
-	rc                = in->bridge.enqueue(in->bridge.context, &native, events, touch);
+	rc                = in->bridge.enqueue(in->bridge.context, &native, has_touch);
 	if (rc >= 0)
 		*execution_id = native.request_id;
 	return rc;

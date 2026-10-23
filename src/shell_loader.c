@@ -84,6 +84,9 @@ static int load_service(SceSize argc, void *args)
 	}
 
 	report("Shell service load", rc);
+
+	/* Returning would leave the thread dormant, holding its 32 KiB stack in Shell. */
+	sceKernelExitDeleteThread(0);
 	return 0;
 }
 

@@ -214,7 +214,8 @@ int vau_diagnostics_start(void)
 	atomic_init(&last_result, 0);
 	atomic_init(&log_result, 0);
 
-	int thread = sceKernelCreateThread("VauDiagnostics", diagnostic_thread, 0x10000100, 8192, 0, 0,
+	/* Its deepest path is under 1 KiB, plus thin SceNet wrappers. */
+	int thread = sceKernelCreateThread("VauDiagnostics", diagnostic_thread, 0x10000100, 4096, 0, 0,
 	                                   NULL);
 
 	if (thread < 0)

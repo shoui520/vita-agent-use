@@ -30,17 +30,16 @@ static int heartbeat(void *ctx)
 	return vauInputHeartbeat();
 }
 
-static int submit(void *ctx, const VauSequence *s, const VauEvent *e)
+static int submit(void *ctx, const VauSequence *s)
 {
 	(void)ctx;
-	return vauInputSubmit(s, e);
+	return vauInputSubmit(s);
 }
 
-static int submit_touch(void *ctx, const VauSequence *s, const VauEvent *e,
-                        const VauTouchState *touch)
+static int submit_touch(void *ctx, const VauSequence *s)
 {
 	(void)ctx;
-	return vauInputSubmitTouch(s, e, touch);
+	return vauInputSubmitTouch(s);
 }
 
 static int cancel(void *ctx)
@@ -49,10 +48,16 @@ static int cancel(void *ctx)
 	return vauInputCancel();
 }
 
-static int enqueue(void *ctx, const VauSequence *s, const VauEvent *e, const VauTouchState *touch)
+static int enqueue(void *ctx, const VauSequence *s, uint32_t has_touch)
 {
 	(void)ctx;
-	return vauInputEnqueue(s, e, touch);
+	return vauInputEnqueue(s, has_touch);
+}
+
+static int stage(void *ctx, uint32_t kind, uint32_t index, uint32_t count, const void *entries)
+{
+	(void)ctx;
+	return vauInputStage(kind, index, count, entries);
 }
 
 static int release(void *ctx)
@@ -69,4 +74,4 @@ static int status(void *ctx, VauStatus *out)
 const struct vau_input_bridge vau_vita_input_bridge = { NULL,         clock_us, acquire,
 	                                                    heartbeat,    submit,   cancel,
 	                                                    release,      status,   acquire_process,
-	                                                    submit_touch, enqueue };
+	                                                    submit_touch, enqueue,  stage };

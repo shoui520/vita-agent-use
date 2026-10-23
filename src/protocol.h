@@ -9,10 +9,25 @@
 #include "native_ops.h"
 #include <stddef.h>
 #include "json.h"
+#include "sha256.h"
 
 #define VAU_REQUEST_BYTES  131072u
 #define VAU_RESPONSE_BYTES 4096u
 #define VAU_COMMAND_TOKENS 128u
+#define VAU_STAGE_CHUNK    32u
+
+/* Shell has little memory to spare, so parsed events and touch states go to
+ * the kernel's staging through one small chunk per kind. The newest entry stays
+ * in the chunk until the next one starts: readable events at one timestamp
+ * merge into it. */
+struct vau_input_stream {
+	int (*stage)(void *context, uint32_t kind, uint32_t index, uint32_t count, const void *entries);
+	void *context;
+	struct vau_sha256 hash[2];
+	uint32_t base[2], fill[2];
+	VauEvent events[VAU_STAGE_CHUNK];
+	VauTouchState touch[VAU_STAGE_CHUNK];
+};
 
 /* Lifetime granted by pairing, saved-peer sessions and session.extend. */
 #define VAU_SESSION_LIFETIME_US UINT64_C(3600000000)
@@ -40,9 +55,10 @@ struct vau_command {
 	unsigned content_kind, content_user;
 	int32_t process;
 	VauSequence sequence;
-	VauEvent events[VAU_MAX_EVENTS];
+	uint32_t last_at_us; /* Final event's offset, for the duration check. */
 	unsigned has_touch, readable_input;
-	VauTouchState touch[VAU_MAX_EVENTS];
+	unsigned char staged_digest[2][32]; /* Per stage kind, over what was staged. */
+	struct vau_input_stream stream;
 };
 
 struct vau_session {

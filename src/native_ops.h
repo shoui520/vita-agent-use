@@ -174,16 +174,18 @@ struct vau_native_api {
 
 	int (*input)(void *context, uint64_t handle, enum vau_input_operation op, VauStatus *status,
 	             uint64_t *lease_until);
+	/* Parsing stages events and touch states in order; the submits below
+	 * consume exactly sequence->count staged entries. */
+	int (*input_stage)(void *context, uint32_t kind, uint32_t index, uint32_t count,
+	                   const void *entries);
 	int (*input_submit)(void *context, uint64_t handle, const VauSequence *sequence,
-	                    const VauEvent *events, uint64_t *execution_id);
+	                    uint64_t *execution_id);
 	int (*input_acquire_process)(void *context, uint64_t handle, int32_t process,
 	                             uint64_t *lease_until);
 	int (*input_submit_touch)(void *context, uint64_t handle, const VauSequence *sequence,
-	                          const VauEvent *events, const VauTouchState *touch,
 	                          uint64_t *execution_id);
 	int (*input_enqueue)(void *context, uint64_t handle, const VauSequence *sequence,
-	                     const VauEvent *events, const VauTouchState *touch,
-	                     uint64_t *execution_id);
+	                     uint32_t has_touch, uint64_t *execution_id);
 };
 
 struct vau_native_reply {

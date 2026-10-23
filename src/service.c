@@ -185,8 +185,16 @@ static int input_dispatch(void *context, uint64_t handle, enum vau_input_operati
 	return rc;
 }
 
+static int input_stage(void *context, uint32_t kind, uint32_t index, uint32_t count,
+                       const void *entries)
+{
+	struct vau_service *s = context;
+
+	return vau_input_owner_stage(&s->input, kind, index, count, entries);
+}
+
 static int input_submit(void *context, uint64_t handle, const VauSequence *sequence,
-                        const VauEvent *events, uint64_t *execution_id)
+                        uint64_t *execution_id)
 {
 	struct vau_service *s = context;
 
@@ -194,7 +202,7 @@ static int input_submit(void *context, uint64_t handle, const VauSequence *seque
 		return VAU_UNSUPPORTED;
 	if (s->approval_pending)
 		return VAU_BUSY;
-	return vau_input_owner_submit(&s->input, &s->auth, handle, sequence, events, execution_id);
+	return vau_input_owner_submit(&s->input, &s->auth, handle, sequence, execution_id);
 }
 
 static int input_acquire_process(void *context, uint64_t handle, int32_t process,
@@ -214,7 +222,6 @@ static int input_acquire_process(void *context, uint64_t handle, int32_t process
 }
 
 static int input_submit_touch(void *context, uint64_t handle, const VauSequence *sequence,
-                              const VauEvent *events, const VauTouchState *touch,
                               uint64_t *execution_id)
 {
 	struct vau_service *s = context;
@@ -223,12 +230,11 @@ static int input_submit_touch(void *context, uint64_t handle, const VauSequence 
 		return VAU_UNSUPPORTED;
 	if (s->approval_pending)
 		return VAU_BUSY;
-	return vau_input_owner_submit_touch(&s->input, &s->auth, handle, sequence, events, touch,
-	                                    execution_id);
+	return vau_input_owner_submit_touch(&s->input, &s->auth, handle, sequence, execution_id);
 }
 
 static int input_enqueue(void *context, uint64_t handle, const VauSequence *sequence,
-                         const VauEvent *events, const VauTouchState *touch, uint64_t *execution_id)
+                         uint32_t has_touch, uint64_t *execution_id)
 {
 	struct vau_service *s = context;
 
@@ -236,8 +242,7 @@ static int input_enqueue(void *context, uint64_t handle, const VauSequence *sequ
 		return VAU_UNSUPPORTED;
 	if (s->approval_pending)
 		return VAU_BUSY;
-	return vau_input_owner_enqueue(&s->input, &s->auth, handle, sequence, events, touch,
-	                               execution_id);
+	return vau_input_owner_enqueue(&s->input, &s->auth, handle, sequence, has_touch, execution_id);
 }
 
 int vau_service_request(struct vau_service *s, const struct vau_native_api *api,
@@ -267,6 +272,7 @@ int vau_service_request(struct vau_service *s, const struct vau_native_api *api,
 
 	bound.input_context         = s;
 	bound.input                 = input_dispatch;
+	bound.input_stage           = input_stage;
 	bound.input_submit          = input_submit;
 	bound.input_acquire_process = input_acquire_process;
 	bound.input_submit_touch    = input_submit_touch;

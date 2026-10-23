@@ -16,6 +16,87 @@ static const struct button buttons[] = {
 	{ "TRIANGLE", 4096 }, { "CIRCLE", 8192 }, { "CROSS", 16384 }, { "SQUARE", 32768 }
 };
 
+void vau_input_stream_init(struct vau_input_stream *s, void *context,
+                           int (*stage)(void *, uint32_t, uint32_t, uint32_t, const void *))
+{
+	s->stage   = stage;
+	s->context = context;
+	for (unsigned kind = 0; kind < 2; kind++) {
+		vau_sha256_init(&s->hash[kind]);
+		s->base[kind] = s->fill[kind] = 0;
+	}
+}
+
+static unsigned char *chunk(struct vau_input_stream *s, uint32_t kind, size_t *size)
+{
+	*size = kind == VAU_STAGE_TOUCH ? sizeof(*s->touch) : sizeof(*s->events);
+	return kind == VAU_STAGE_TOUCH ? (unsigned char *)s->touch : (unsigned char *)s->events;
+}
+
+static int flush(struct vau_input_stream *s, uint32_t kind)
+{
+	size_t size;
+	const unsigned char *entries = chunk(s, kind, &size);
+
+	if (!s->fill[kind])
+		return VAU_OK;
+	if (!s->stage)
+		return VAU_UNSUPPORTED;
+
+	int rc = s->stage(s->context, kind, s->base[kind], s->fill[kind], entries);
+
+	if (rc < 0)
+		return rc;
+
+	vau_sha256_update(&s->hash[kind], entries, s->fill[kind] * size);
+	s->base[kind] += s->fill[kind];
+	s->fill[kind] = 0;
+	return VAU_OK;
+}
+
+int vau_input_stream_put(struct vau_input_stream *s, uint32_t kind, uint32_t index,
+                         const void *entry)
+{
+	if (kind > VAU_STAGE_TOUCH)
+		return VAU_INVALID;
+
+	uint32_t end = s->base[kind] + s->fill[kind];
+
+	if (index == end) {
+		/* A new entry makes the newest one final, so a full chunk can go. */
+		if (s->fill[kind] == VAU_STAGE_CHUNK) {
+			int rc = flush(s, kind);
+
+			if (rc < 0)
+				return rc;
+		}
+
+		s->fill[kind]++;
+	} else if (index + 1 != end || !s->fill[kind]) {
+		return VAU_INVALID;
+	}
+
+	size_t size;
+	unsigned char *entries = chunk(s, kind, &size);
+
+	memcpy(entries + (index - s->base[kind]) * size, entry, size);
+	return VAU_OK;
+}
+
+int vau_input_stream_finish(struct vau_input_stream *s, unsigned char digests[2][32])
+{
+	for (uint32_t kind = 0; kind < 2; kind++) {
+		int rc = flush(s, kind);
+
+		if (rc < 0)
+			return rc;
+
+		vau_sha256_finish(&s->hash[kind], digests[kind]);
+	}
+
+	return VAU_OK;
+}
+
 static int number(const char *json, const struct vau_json_token *t, unsigned max, unsigned *out)
 {
 	uint64_t n;
@@ -235,9 +316,9 @@ int vau_input_events_parse(const char *json, const struct vau_json_token *t, siz
 
 		if (!n && at)
 			return VAU_INVALID;
-		if (n && at < out->events[n - 1].at_us)
+		if (n && at < out->last_at_us)
 			return VAU_INVALID;
-		if (n && at == out->events[n - 1].at_us) {
+		if (n && at == out->last_at_us) {
 			if (!readable || (grouped & (seen & ~1u)))
 				return VAU_INVALID;
 
@@ -251,9 +332,15 @@ int vau_input_events_parse(const char *json, const struct vau_json_token *t, siz
 			grouped = seen & ~1u;
 		}
 
-		out->events[n] = (VauEvent){ at, pad };
-		if (readable)
-			out->touch[n] = touch;
+		VauEvent event = { at, pad };
+		int rc         = vau_input_stream_put(&out->stream, VAU_STAGE_EVENTS, n, &event);
+
+		if (rc >= 0 && readable)
+			rc = vau_input_stream_put(&out->stream, VAU_STAGE_TOUCH, n, &touch);
+		if (rc < 0)
+			return rc;
+
+		out->last_at_us = at;
 	}
 
 	return next < 0 || readable < 0 ? VAU_INVALID : VAU_OK;

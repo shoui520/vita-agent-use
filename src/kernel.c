@@ -31,6 +31,9 @@
 static struct vau_timeline timeline;
 static VauEvent staging[VAU_MAX_EVENTS];
 static VauTouchState touch_staging[VAU_MAX_EVENTS];
+
+/* Protected by guard: contiguous entries Shell staged from index 0, per kind. */
+static uint32_t staged[2];
 static struct vau_touch_panel touch_panels[2];
 static uint64_t touch_changed;
 static int touch_published;
@@ -393,30 +396,74 @@ int vauInputHeartbeat(void)
 	return rc;
 }
 
-int vauInputSubmit(const VauSequence *user_sequence, const VauEvent *user_events)
+int vauInputStage(uint32_t kind, uint32_t index, uint32_t count, const void *user_entries)
 {
-	VauSequence sequence;
 	uint32_t state;
 	int rc;
 
 	ENTER_SYSCALL(state);
 	rc = enter();
 	if (rc >= 0) {
+		if (kind > VAU_STAGE_TOUCH) {
+			rc = VAU_INVALID;
+		} else {
+			/* Chunks append in order; a gap or failed copy leaves nothing staged. */
+			if (!count || count > VAU_MAX_EVENTS || index > VAU_MAX_EVENTS - count ||
+			    (index && index != staged[kind])) {
+				rc = VAU_INVALID;
+			} else if (kind == VAU_STAGE_EVENTS) {
+				rc = ksceKernelCopyFromUser(&staging[index], user_entries,
+				                            count * sizeof(*staging));
+			} else {
+				rc = ksceKernelCopyFromUser(&touch_staging[index], user_entries,
+				                            count * sizeof(*touch_staging));
+			}
+
+			staged[kind] = rc < 0 ? 0 : index + count;
+		}
+
+		rc = leave(rc);
+	}
+
+	EXIT_SYSCALL(state);
+	return rc;
+}
+
+/* Guard held. Every commit consumes the staged arrays, whatever its outcome. */
+static void take_staged(uint32_t counts[2])
+{
+	counts[VAU_STAGE_EVENTS] = staged[VAU_STAGE_EVENTS];
+	counts[VAU_STAGE_TOUCH]  = staged[VAU_STAGE_TOUCH];
+	staged[VAU_STAGE_EVENTS] = staged[VAU_STAGE_TOUCH] = 0;
+}
+
+static int staged_complete(const VauSequence *s, const uint32_t counts[2], int touch)
+{
+	return s->count && s->count <= VAU_MAX_EVENTS && counts[VAU_STAGE_EVENTS] == s->count &&
+	       (!touch || counts[VAU_STAGE_TOUCH] == s->count);
+}
+
+int vauInputSubmit(const VauSequence *user_sequence)
+{
+	VauSequence sequence;
+	uint32_t counts[2], state;
+	int rc;
+
+	ENTER_SYSCALL(state);
+	rc = enter();
+	if (rc >= 0) {
+		take_staged(counts);
 		rc = ksceKernelCopyFromUser(&sequence, user_sequence, sizeof(sequence));
 		if (rc >= 0) {
-			if (!sequence.count || sequence.count > VAU_MAX_EVENTS) {
+			if (!staged_complete(&sequence, counts, 0)) {
 				rc = VAU_INVALID;
 			} else {
-				rc = ksceKernelCopyFromUser(staging, user_events,
-				                            sequence.count * sizeof(*staging));
-				if (rc >= 0) {
-					uint64_t now = now_us();
+				uint64_t now = now_us();
 
-					(void)check_process(now);
-					rc = vau_stop_ready(&stop_monitor, now)
-					             ? vau_timeline_submit(&timeline, &sequence, staging, now)
-					             : VAU_DENIED;
-				}
+				(void)check_process(now);
+				rc = vau_stop_ready(&stop_monitor, now)
+				             ? vau_timeline_submit(&timeline, &sequence, staging, now)
+				             : VAU_DENIED;
 			}
 		}
 
@@ -427,11 +474,10 @@ int vauInputSubmit(const VauSequence *user_sequence, const VauEvent *user_events
 	return rc;
 }
 
-int vauInputSubmitTouch(const VauSequence *user_sequence, const VauEvent *user_events,
-                        const VauTouchState *user_touch)
+int vauInputSubmitTouch(const VauSequence *user_sequence)
 {
 	VauSequence sequence;
-	uint32_t state;
+	uint32_t counts[2], state;
 	int rc;
 
 	ENTER_SYSCALL(state);
@@ -439,6 +485,7 @@ int vauInputSubmitTouch(const VauSequence *user_sequence, const VauEvent *user_e
 	if (rc >= 0) {
 		uint64_t now = now_us();
 
+		take_staged(counts);
 		(void)check_process(now);
 		vau_timeline_tick(&timeline, now, apply_pad, NULL);
 		if (!vau_stop_ready(&stop_monitor, now) || timeline.inhibited || timeline.stopped)
@@ -447,47 +494,36 @@ int vauInputSubmitTouch(const VauSequence *user_sequence, const VauEvent *user_e
 			rc = VAU_EXPIRED;
 		else
 			rc = ksceKernelCopyFromUser(&sequence, user_sequence, sizeof(sequence));
-		if (rc >= 0) {
-			if (!sequence.count || sequence.count > VAU_MAX_EVENTS) {
-				rc = VAU_INVALID;
-			} else {
-				rc = ksceKernelCopyFromUser(staging, user_events,
-				                            sequence.count * sizeof(*staging));
-				if (rc >= 0) {
-					rc = ksceKernelCopyFromUser(touch_staging, user_touch,
-					                            sequence.count * sizeof(*touch_staging));
-				}
+		if (rc >= 0 && !staged_complete(&sequence, counts, 1)) {
+			rc = VAU_INVALID;
+		} else if (rc >= 0 && sequence.request_id == timeline.sequence.request_id) {
+			rc = vau_timeline_submit_touch(&timeline, &sequence, staging, touch_staging,
+			                               touch_panels, now_us());
+		} else if (rc >= 0) {
+			struct vau_touch_panel panels[2] = { { 0 } };
+			unsigned enabled                 = 0;
 
-				if (rc >= 0 && sequence.request_id == timeline.sequence.request_id) {
-					rc = vau_timeline_submit_touch(&timeline, &sequence, staging, touch_staging,
-					                               touch_panels, now_us());
-				} else if (rc >= 0) {
-					struct vau_touch_panel panels[2] = { { 0 } };
-					unsigned enabled                 = 0;
-
-					for (unsigned i = 0; i < sequence.count; i++)
-						enabled |= touch_staging[i].enabled;
-					for (unsigned port = 0; port < 2 && rc >= 0; port++)
-						if (enabled & (1u << port))
-							rc = vau_touch_kernel_panel(port, &panels[port]);
-					if (rc >= 0) {
-						rc = vau_timeline_validate_touch(&timeline, &sequence, staging,
-						                                 touch_staging, panels, now_us());
-					}
-
-					/* No patching for malformed input, expired leases or busy
-					 * sequences. Installation precedes committing the queue. */
-					if (rc >= 0 && enabled)
-						rc = vau_touch_kernel_enable();
-					if (rc >= 0) {
-						rc = vau_timeline_submit_touch(&timeline, &sequence, staging, touch_staging,
-						                               panels, now_us());
-					}
-
-					if (rc >= 0)
-						memcpy(touch_panels, panels, sizeof(panels));
-				}
+			for (unsigned i = 0; i < sequence.count; i++)
+				enabled |= touch_staging[i].enabled;
+			for (unsigned port = 0; port < 2 && rc >= 0; port++)
+				if (enabled & (1u << port))
+					rc = vau_touch_kernel_panel(port, &panels[port]);
+			if (rc >= 0) {
+				rc = vau_timeline_validate_touch(&timeline, &sequence, staging, touch_staging,
+				                                 panels, now_us());
 			}
+
+			/* No patching for malformed input, expired leases or busy
+			 * sequences. Installation precedes committing the queue. */
+			if (rc >= 0 && enabled)
+				rc = vau_touch_kernel_enable();
+			if (rc >= 0) {
+				rc = vau_timeline_submit_touch(&timeline, &sequence, staging, touch_staging, panels,
+				                               now_us());
+			}
+
+			if (rc >= 0)
+				memcpy(touch_panels, panels, sizeof(panels));
 		}
 
 		rc = leave(rc);
@@ -497,11 +533,10 @@ int vauInputSubmitTouch(const VauSequence *user_sequence, const VauEvent *user_e
 	return rc;
 }
 
-int vauInputEnqueue(const VauSequence *user_sequence, const VauEvent *user_events,
-                    const VauTouchState *user_touch)
+int vauInputEnqueue(const VauSequence *user_sequence, uint32_t has_touch)
 {
 	VauSequence sequence;
-	uint32_t state;
+	uint32_t counts[2], state;
 	int rc;
 
 	ENTER_SYSCALL(state);
@@ -509,6 +544,7 @@ int vauInputEnqueue(const VauSequence *user_sequence, const VauEvent *user_event
 	if (rc >= 0) {
 		uint64_t now = now_us();
 
+		take_staged(counts);
 		(void)check_process(now);
 		vau_timeline_tick(&timeline, now, apply_pad, NULL);
 		if (!vau_stop_ready(&stop_monitor, now) || timeline.inhibited || timeline.stopped ||
@@ -521,23 +557,17 @@ int vauInputEnqueue(const VauSequence *user_sequence, const VauEvent *user_event
 		}
 
 		if (rc >= 0) {
-			if (!sequence.count || sequence.count > VAU_MAX_EVENTS) {
+			if (!staged_complete(&sequence, counts, has_touch != 0)) {
 				rc = VAU_INVALID;
 			} else {
-				rc = ksceKernelCopyFromUser(staging, user_events,
-				                            sequence.count * sizeof(*staging));
-				if (rc >= 0 && user_touch) {
-					rc = ksceKernelCopyFromUser(touch_staging, user_touch,
-					                            sequence.count * sizeof(*touch_staging));
-				}
-
+				const VauTouchState *touch = has_touch ? touch_staging : NULL;
 				struct vau_touch_panel panels[2];
 
 				memcpy(panels, touch_panels, sizeof(panels));
 
 				unsigned enabled = 0;
 
-				if (user_touch && rc >= 0) {
+				if (touch) {
 					for (unsigned i = 0; i < sequence.count; ++i)
 						enabled |= touch_staging[i].enabled;
 					for (unsigned port = 0; port < 2 && rc >= 0; ++port)
@@ -546,20 +576,18 @@ int vauInputEnqueue(const VauSequence *user_sequence, const VauEvent *user_event
 				}
 
 				if (rc >= 0) {
-					rc = vau_timeline_enqueue(&timeline, &sequence, staging,
-					                          user_touch ? touch_staging : NULL, panels, now_us(),
-					                          1);
+					rc = vau_timeline_enqueue(&timeline, &sequence, staging, touch, panels,
+					                          now_us(), 1);
 				}
 
 				if (rc >= 0 && enabled)
 					rc = vau_touch_kernel_enable();
 				if (rc >= 0) {
-					rc = vau_timeline_enqueue(&timeline, &sequence, staging,
-					                          user_touch ? touch_staging : NULL, panels, now_us(),
-					                          0);
+					rc = vau_timeline_enqueue(&timeline, &sequence, staging, touch, panels,
+					                          now_us(), 0);
 				}
 
-				if (rc >= 0 && user_touch)
+				if (rc >= 0 && touch)
 					memcpy(touch_panels, panels, sizeof(panels));
 			}
 		}

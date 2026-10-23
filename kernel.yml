@@ -13,6 +13,7 @@ vita_agent_kernel:
         - vauInputAcquire
         - vauInputAcquireForProcess
         - vauInputHeartbeat
+        - vauInputStage
         - vauInputSubmit
         - vauInputSubmitTouch
         - vauInputEnqueue

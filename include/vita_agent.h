@@ -121,18 +121,26 @@ int vauInputAcquire(void);
  * automatic resume. Sampling is not an atomic guarantee against routing races. */
 int vauInputAcquireForProcess(int32_t process_id);
 int vauInputHeartbeat(void);
-int vauInputSubmit(const VauSequence *sequence, const VauEvent *events);
+
+/* Shell has little memory to spare, so sequences are held only here. Shell
+ * copies events (VAU_STAGE_EVENTS) or touch states (VAU_STAGE_TOUCH) in
+ * contiguous chunks; index 0 restarts that array. Submit, SubmitTouch and
+ * Enqueue then validate and consume exactly sequence->count staged entries.
+ * Every commit attempt discards the staged arrays, so each sequence is staged
+ * again in full. */
+#define VAU_STAGE_EVENTS 0u
+#define VAU_STAGE_TOUCH  1u
+int vauInputStage(uint32_t kind, uint32_t index, uint32_t count, const void *entries);
+int vauInputSubmit(const VauSequence *sequence);
 
 /* Same sequence timing/repeats/lease, one touch state per event. Ordinary input
  * remains unbound; a macro's process binding also applies to its touch states.
- * Shell copies are validated before deferred hooking. */
-int vauInputSubmitTouch(const VauSequence *sequence, const VauEvent *events,
-                        const VauTouchState *touch);
+ * Staged copies are validated before deferred hooking. */
+int vauInputSubmitTouch(const VauSequence *sequence);
 
 /* Process-bound macro continuation; zero start derives the prior segment end.
- * Optional touch contains one state per event, same limits as SubmitTouch. */
-int vauInputEnqueue(const VauSequence *sequence, const VauEvent *events,
-                    const VauTouchState *touch);
+ * With has_touch, one staged touch state per event, same limits as SubmitTouch. */
+int vauInputEnqueue(const VauSequence *sequence, uint32_t has_touch);
 int vauInputCancel(void);
 int vauInputRelease(void);
 int vauInputGetStatus(VauStatus *status);

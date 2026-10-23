@@ -93,7 +93,8 @@ static int init(void)
 		return rc;
 	}
 
-	worker = sceKernelCreateThread("vau_perf", sampler, 0x10000100, 0x4000, 0, 0, NULL);
+	/* The sampler's deepest path is about 0.3 KiB; Shell memory is scarce. */
+	worker = sceKernelCreateThread("vau_perf", sampler, 0x10000100, 0x1000, 0, 0, NULL);
 
 	int rc = worker < 0 ? worker : sceKernelStartThread(worker, 0, NULL);
 
