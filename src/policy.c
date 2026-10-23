@@ -32,6 +32,14 @@ static int under(const char *path, const char *root)
 	return !*root && (!*path || *path == '/');
 }
 
+/* The runtime and loader logs hold only fixed stage names, timestamps and
+ * integer results. Expose those files for readback, never their siblings. */
+static int diagnostic_log(enum vau_file_operation op, const char *path)
+{
+	return op == VAU_FS_READ && (!strcmp(path, "ur0:data/vita-agent-use/runtime.log") ||
+	                             !strcmp(path, "ur0:data/vita-agent-use/loader.log"));
+}
+
 static int overlaps(const char *path, const char *root)
 {
 	return under(path, root) || under(root, path);
@@ -146,9 +154,7 @@ enum vau_policy_decision vau_policy_file(enum vau_file_operation op, const char 
 	if (!known)
 		return VAU_POLICY_INVALID;
 
-	/* This diagnostic stream contains only fixed stage names, timestamps and
-	 * integer results. Expose the exact file for readback, never its siblings. */
-	if (op == VAU_FS_READ && !strcmp(p, "ur0:data/vita-agent-use/runtime.log"))
+	if (diagnostic_log(op, p))
 		return VAU_POLICY_ALLOW;
 
 	/* Secrets, approvals, audit records and trash internals are accessed by
@@ -321,7 +327,7 @@ enum vau_policy_decision vau_policy_evaluate(const struct vau_file_policy *polic
 	};
 	for (unsigned i = 0; i < sizeof(internal) / sizeof(*internal); ++i) {
 		if ((under(p, internal[i]) || (destructive && under(internal[i], p))) &&
-		    !(op == VAU_FS_READ && !strcmp(p, "ur0:data/vita-agent-use/runtime.log"))) {
+		    !diagnostic_log(op, p)) {
 			return VAU_POLICY_PROTECTED;
 		}
 	}

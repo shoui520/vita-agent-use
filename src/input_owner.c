@@ -254,10 +254,15 @@ int vau_input_owner_status(struct vau_input_owner *in, const struct vau_auth *au
 
 	memset(status, 0, sizeof(*status));
 
-	int rc = owner(in, auth, handle);
+	int rc = vau_input_owner_poll(in, auth);
 
 	if (rc < 0)
 		return rc;
+
+	/* Reading status needs no lease: once input is idle, any controller sees
+	 * how the last sequence ended. Another controller's live lease stays private. */
+	if (!allowed(auth, handle, in->last_us) || (in->handle && in->handle != handle))
+		return VAU_DENIED;
 
 	rc = in->bridge.status(in->bridge.context, status);
 	if (rc >= 0 &&

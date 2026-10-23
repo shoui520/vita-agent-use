@@ -89,9 +89,6 @@ static int diagnostic_thread(SceSize argc, void *args)
 		return rc;
 	}
 
-	uint64_t last = 0;
-	int replied   = 0;
-
 	for (;;) {
 		unsigned char request[64];
 		SceNetSockaddrIn peer = { 0 };
@@ -112,13 +109,6 @@ static int diagnostic_thread(SceSize argc, void *args)
 			continue;
 		}
 
-		uint64_t now = (uint64_t)sceKernelGetSystemTimeWide();
-
-		if (replied && (now < last || now - last < 1000000))
-			continue;
-
-		last    = now;
-		replied = 1;
 		if (network_request) {
 			char response[256];
 			int n = vau_snprintf(

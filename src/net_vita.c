@@ -17,13 +17,19 @@ void vau_net_socket_init(struct vau_net_socket *s)
 	s->error = 0;
 }
 
+/* Records only real failures: a nonblocking socket reports EAGAIN on every
+ * idle read, which would otherwise show up as the reason a connection closed. */
 static int net_error(struct vau_net_socket *s, int rc)
 {
 	int *value = sceNetErrnoLoc();
+	int error  = rc == -1 && value ? *value : rc;
 
-	s->error = rc == -1 && value ? *value : rc;
-	return s->error == SCE_NET_EAGAIN || s->error == SCE_NET_EINTR ||
-	       (unsigned)s->error == SCE_NET_ERROR_EAGAIN || (unsigned)s->error == SCE_NET_ERROR_EINTR;
+	if (error == SCE_NET_EAGAIN || error == SCE_NET_EINTR ||
+	    (unsigned)error == SCE_NET_ERROR_EAGAIN || (unsigned)error == SCE_NET_ERROR_EINTR)
+		return 1;
+
+	s->error = error;
+	return 0;
 }
 
 void vau_net_close(struct vau_net_socket *s)

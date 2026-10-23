@@ -91,13 +91,30 @@ static int log_event(const char *stage, int result, int detail)
 	return logging;
 }
 
+/* The system masks the whole pad while the screen is off. That pause is
+ * expected; a mask hiding only PS or SELECT is a real problem. */
+static int pad_held_by_system(void)
+{
+	VauInputObservation o = { 0 };
+
+	return vauInputGetObservation(&o) >= 0 && o.reason == 3 && !(o.mask & 0xffffu);
+}
+
 static void network_event(unsigned stage, int result, int detail)
 {
+	static int quiet_pause;
+
 	vau_diagnostics_network(stage, result, detail);
 	/* Pushed performance belongs to the session, which outlives a dropped
 	 * connection for the grace period. */
 	if (stage == 6 || stage == 12)
 		vau_performance_stop();
+	if (stage == 7)
+		quiet_pause = pad_held_by_system();
+	if ((stage == 7 || stage == 8) && quiet_pause) {
+		quiet_pause = stage == 7;
+		return;
+	}
 	if ((stage >= 5 && stage <= 8) || (stage >= 10 && stage <= 12)) {
 		log_event(stage == 5    ? "connection closed"
 		          : stage == 6  ? "command service closed"
@@ -194,6 +211,24 @@ static int admission_check(int hand_over)
 	if (admission_resets < 3)
 		++admission_resets;
 	return 0;
+}
+
+/* Net may still be starting when the runtime does; failures this early are
+ * retried quietly. */
+#define NET_STARTUP_US UINT64_C(30000000)
+
+static uint64_t started_us;
+static int pairing_listened;
+
+/* Pairing mode failed before serving a PC: Net is still starting at boot, or
+ * a Wi-Fi reconnect invalidated the listener. Name it and keep the native
+ * reason, rather than calling it the command service returning to pairing. */
+static void pairing_failed(int rc)
+{
+	if (!pairing_listened && now_us() - started_us < NET_STARTUP_US)
+		return;
+
+	log_event("pairing listener reset", rc, waiter.error ? waiter.error : listener.error);
 }
 
 static void notice_event(int result, int pending)
@@ -493,6 +528,9 @@ static void unpaired_reply(void)
 
 static int pair_once(void)
 {
+	/* Socket errors are diagnostic only; keep this attempt's apart from older ones. */
+	listener.error = waiter.error = 0;
+
 	/* Admission proves certificate possession but grants no trust. Sessions
 	 * require exact saved-certificate equality; pairing requires native OK. */
 	int rc = vau_tls_server_init_pairing(
@@ -519,6 +557,7 @@ static int pair_once(void)
 	/* Start the diagnostic socket only after shared Net accepted our listener.
 	 * Starting it at worker entry could precede Shell/companion Net startup. */
 	(void)vau_diagnostics_start();
+	pairing_listened = 1;
 	report("pairing listening", PAIR_PORT);
 	for (;;) {
 		prevent_auto_suspend();
@@ -789,8 +828,12 @@ static int runtime_thread(SceSize args, void *argp)
 	}
 
 	vau_pairing_worker_init(&ui, &service, &vau_vita_native_api, rc >= 0 ? &notifications : NULL);
+	started_us = now_us();
 	for (;;) {
 		rc = pair_once();
+
+		int served = rc >= 0;
+
 		if (rc >= 0) {
 			rc = vau_tls_server_init(&server, (struct vau_tls_der){ certificate, certificate_size },
 			                         (struct vau_tls_der){ key, key_size },
@@ -873,7 +916,10 @@ static int runtime_thread(SceSize args, void *argp)
 			vau_auth_stop(&service.auth);
 		(void)vau_service_poll(&service);
 		vau_tls_server_free(&server);
-		report("service returning to pairing", rc);
+		if (served)
+			report("service returning to pairing", rc);
+		else
+			pairing_failed(rc);
 		for (unsigned i = 0; i < 63; i++) {
 			(void)vau_service_poll(&service);
 			sceKernelDelayThread(16000);
