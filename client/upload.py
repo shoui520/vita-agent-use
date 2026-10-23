@@ -10,12 +10,14 @@ from pathlib import Path
 import stat
 import time
 import uuid
+from errors import describe
 from vita_client import VitaClient, ClientError, UploadError, private_json, durable_json, ensure_private
 
 
-def checked(result, allow_readback=False):
+def checked(result, allow_readback=False, path=None):
     if result['code']:
-        raise ClientError('Vita upload returned %d; retain the transfer state and operation ID.' % result['code'])
+        name, message = describe(result['code'], 'fs.upload', path)
+        raise ClientError('Upload refused (%s, code %d): %s The transfer state is kept, so the same command resumes.' % (name, result['code'], message))
     if result['readback_required'] and not allow_readback:
         raise ClientError('Config readback is required; this ordinary-file workflow cannot acknowledge it.')
     return result
@@ -25,7 +27,8 @@ def upload(client, source, destination, transfer_state, overwrite=False, expecte
     VitaClient._command('fs.mkdir', {'operation_id':'0'*32,'path':destination,'yes':yes})
     if type(overwrite) is not bool or not isinstance(expected_sha256, str) or not re.fullmatch('(?:[0-9a-f]{64})?' if overwrite else '', expected_sha256):
         raise ClientError('Invalid optional original SHA256.')
-    if overwrite and not yes:raise ClientError('Overwrite requires --yes.')
+    # --overwrite already states the intent to replace.
+    yes = yes or overwrite
     is_config = destination.lower() in ('ur0:tai/config.txt', 'ux0:tai/config.txt', 'uma0:tai/config.txt')
     if type(skip_hash) is not bool or (skip_hash and (is_config or expected_sha256)):
         raise ClientError('Skipping hashes is unavailable for guarded config or an original SHA256 precondition.')
@@ -37,7 +40,7 @@ def upload(client, source, destination, transfer_state, overwrite=False, expecte
         raise ClientError('Use the guarded config workflow for tai/config.txt.')
     if config_readback is not None and not is_config:
         raise ClientError('Config readback callback is only valid for tai/config.txt.')
-    def check(result):return checked(result, allow_readback=config_readback is not None)
+    def check(result):return checked(result, allow_readback=config_readback is not None, path=destination)
     def complete(result):
         if config_readback is not None:
             if not result['readback_required']:raise ClientError('Vita did not require config readback.')

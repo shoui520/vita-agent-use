@@ -816,6 +816,8 @@ def request(options,method,args=None,*,emit_progress=None,emit_output=None):
                     raw=stream.readline(MAX_IPC+1)
                     if len(raw)>MAX_IPC or not raw.endswith(b'\n'):raise ClientError('Incomplete or oversized PC server reply.')
                     reply=strict_json(raw)
+                    # Commands that only stream output (performance samples) end with null.
+                    if reply is None:return None
                     if not isinstance(reply,dict):raise ClientError('Invalid PC server reply.')
                     status=reply.get('status')
                     if status=='keepalive':continue

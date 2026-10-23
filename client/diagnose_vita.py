@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Read startup/stop diagnostics once; never retry or perform control/file operations."""
+"""Read startup/stop diagnostics; never perform control/file operations."""
 import argparse
 import json
 import socket
@@ -92,11 +92,21 @@ def decode_log(data):
 
 
 def query(host, timeout=3, input_sample=False, logging=False):
+    request = b'log\n' if logging else b'input\n' if input_sample else b'status\n'
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-        sock.settimeout(timeout)
+        sock.settimeout(timeout / 3)
         sock.connect((host, 8846))
-        sock.send(b'log\n' if logging else b'input\n' if input_sample else b'status\n')
-        return (decode_log if logging else decode_input if input_sample else decode)(sock.recv(1024))
+        # UDP can drop a query, and older plugins ignore one sent within a
+        # second of their last reply, so ask up to three times over the timeout.
+        for attempt in range(3):
+            sock.send(request)
+            try:
+                data = sock.recv(1024)
+                break
+            except TimeoutError:
+                if attempt == 2:
+                    raise
+    return (decode_log if logging else decode_input if input_sample else decode)(data)
 
 
 def main():

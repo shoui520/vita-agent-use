@@ -27,17 +27,17 @@ The file is an argument object, not a `v/id/op` envelope.
 
 | Field | Rules |
 |---|---|
-| `start_delay_us` / `start_us` | Exactly one. A delay is 10,000–1,000,000. `start_us` is a decimal **string** on the Vita clock. The high-level runner replaces either with a 150 ms delay. |
-| `duration_us` | 1–3,600,000,000 (one hour per segment). Time after the last event is an idle wait. |
-| `repeats` | 1–1,000,000; the total must fit in 64-bit time. |
-| `max_lateness_us` | 1–1,000,000; exceeding it stops execution rather than shifting the timing. |
-| `events` | Not empty. Starts at 0, never decreases, stays below the duration. At most 1,024 distinct states. |
+| `start_delay_us` / `start_us` | Optional for `input submit`, which always starts 150 ms after submission. Low-level `call input.submit` needs exactly one: a delay of 10,000–1,000,000, or `start_us` as a decimal **string** on the Vita clock. |
+| `duration_us` | 1–3,600,000,000 (one hour per segment). Time after the last event is an idle wait. Default: the last event plus 100 ms. |
+| `repeats` | 1–1,000,000 (default 1); the total must fit in 64-bit time. |
+| `max_lateness_us` | 1–1,000,000 (default 100,000); exceeding it stops execution rather than shifting the timing. |
+| `events` | Not empty. Never decreases and stays below the duration. A first event after 0 starts from the neutral pad. At most 1,024 distinct states. |
 | `at_us` | Offset within the cycle, not time since the previous event. |
 | `buttons` | Uppercase, unique: SELECT START UP RIGHT DOWN LEFT L R TRIANGLE CIRCLE CROSS SQUARE. PS, power and system buttons cannot be injected. The list **replaces** whatever is held; `[]` releases all. |
 | `left_stick`, `right_stick` | `[x,y]`, 0–255, where 128 is centred. |
 | `front`, `back` | Up to 6 front / 4 rear contacts `{id 0–127 unique, x, y 0–32767 within the panel's geometry, force 0–255, default 128}`. `[]` releases; omitting a channel keeps its state. |
 
-A channel that is omitted keeps its state. Several events may share a timestamp only if they change different channels. Every event must change at least one channel; express waits as gaps. A tap is a contact followed by `[]`; a drag keeps the same `id` and moves it. Touch values are **native panel units**: check `touch panels` first.
+A channel that is omitted keeps its state. Events at the same timestamp merge into one state. A channel given two different values at the same timestamp is refused, because one of them would never happen (a press and release at once is no tap). An event with no channel is ignored; express waits as gaps. A tap is a contact followed by `[]`; a drag keeps the same `id` and moves it. Touch values are **native panel units**: check `touch panels` first.
 
 Compact form: events are `[at_us, button_bitmask, lx, ly, rx, ry]` with strictly increasing times starting at 0. An optional `touch` array has one entry per event, `[enabled_bits(front=1, back=2), front_contacts, back_contacts]`, with contacts as `[id, force, x, y]`. An enabled empty panel releases its contacts; a disabled panel leaves physical touch alone. Never mix this with readable-form contacts. CROSS is 16384.
 
@@ -91,16 +91,16 @@ Run each step only after the previous one has finished.
 
 ```sh
 python3 client/vita_agent.py fs mkdir ux0:data/my-app            # only if fs stat says it is missing
-python3 client/vita_agent.py fs upload ./build/data.bin ux0:data/my-app/data.bin --transfer-state ./private-work/data-upload.json
+python3 client/vita_agent.py fs upload ./build/data.bin ux0:data/my-app/data.bin
 python3 client/vita_agent.py fs download ux0:data/my-app/data.bin ./private-work/data-readback.bin   # compare hashes
 ```
 
-To replace an executable: `app close EXAMPLE01`, optionally back it up with `fs download`, then `fs upload ... --overwrite --yes --transfer-state ...`, read it back and compare, then `app launch`. No ACL is needed for ordinary paths. `--expected-sha256` takes the **old** file's hash, never the new source's.
+To replace an executable: `app close EXAMPLE01`, optionally back it up with `fs download`, then `fs upload ... --overwrite --yes`, read it back and compare, then `app launch`. No ACL is needed for ordinary paths. `--expected-sha256` takes the **old** file's hash, never the new source's.
 
 For large ordinary files, add `--skip-hash` to avoid hashing the contents on either the PC or Vita:
 
 ```sh
-./vita-agent fs upload ./data.bin ux0:data/data.bin --transfer-state ./agent/data-upload.json --skip-hash
+./vita-agent fs upload ./data.bin ux0:data/data.bin --skip-hash
 ```
 
 The Vita checks the staged size and committed size, but does not compare a content digest. Permissions, sequential synced chunks, overwrite requirements, journaled commit and audit logging still apply. The matching Shell plugin must advertise support; an older plugin is rejected before upload begins. This option cannot be combined with `--expected-sha256` or used for guarded `tai/config.txt` edits.
@@ -119,7 +119,7 @@ Relevant completion fields for a successful size-only upload are:
 
 Here `verified: false` means that content hashing was skipped, not that the commit failed. `complete: true` and `code: 0` confirm completion with size-only checks. To verify the bytes independently, use `fs download` to a new PC file and compare it with the source on the PC.
 
-Resume by rerunning exactly the same command with `--skip-hash`, the same source and the same transfer-state file. Skip mode saves the source's file identity, size and modification metadata; changing or replacing the source causes resume to be rejected. Do not switch an existing hashed transfer to skip mode or vice versa.
+Resume by rerunning exactly the same command with `--skip-hash`, the same source and destination (and the same `--transfer-state` file if you gave one). Skip mode saves the source's file identity, size and modification metadata; changing or replacing the source causes resume to be rejected. Do not switch an existing hashed transfer to skip mode or vice versa.
 
 To install a VPK, upload it to the Vita first, then:
 
@@ -136,7 +136,7 @@ python3 client/vita_agent.py fs download ur0:tai/config.txt ./private-work/confi
 # edit a separate candidate file; keep every protected plugin's behavior
 python3 client/vita_agent.py config plan ur0:tai/config.txt ./private-work/config-candidate.txt --plan ./private-work/config-plan.json
 python3 client/vita_agent.py acl request ur0:tai/        # wait for the human's OK and state=approved
-python3 client/vita_agent.py config apply --plan ./private-work/config-plan.json --transfer-state ./private-work/config-upload.json --yes
+python3 client/vita_agent.py config apply --plan ./private-work/config-plan.json --yes
 ```
 
 The command prints a diff for review; the `--plan` file holds the bytes and hashes. Never save the printed diff and pass it as the plan. An approved ACL does not satisfy the other checks. Success writes `config-plan.json.readback.json`: check `verified`, the hash, the bytes and the full `text`. Keep the `.candidate` and transfer-state files for recovery. If the file on the Vita matches neither the original nor the candidate, make a fresh plan.

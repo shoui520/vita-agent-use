@@ -3,6 +3,7 @@
 """Unified vita-agent-use command line. JSON output is the default."""
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -11,7 +12,7 @@ import threading
 import time
 import uuid
 
-from vita_client import ClientError, NativeFrameError, UncertainOutcomeError, UploadError, VitaClient, private_json, strict_json, validate_host, validate_agent_name, connection_refused_message
+from vita_client import ClientError, NativeFrameError, UncertainOutcomeError, UploadError, VitaClient, private_json, strict_json, validate_host, validate_agent_name, connection_refused_message, set_screen_hold
 
 CONFIG_ENV = "VITA_AGENT_CONFIG_DIR"
 # bootstrap's default directory, used when the environment names none.
@@ -60,7 +61,7 @@ def parser():
     c.add_argument('--no-wait', action='store_true', help='Return the job ID; query using call decrypt.status.')
     g = group('screen', 'Display control and JPEG capture.')
     cmd(g, 'on', 'screen.on'); cmd(g, 'off', 'screen.off')
-    cmd(g, 'capture').add_argument('--output', type=Path, required=True)
+    cmd(g, 'capture').add_argument('--output', type=Path, help='JPEG path; defaults to vita-capture-DATE-TIME.jpg in the current directory.')
     g = group('fs', 'Complete listings, transfers and native write operations.')
     c = cmd(g, 'list', 'fs.list'); c.add_argument('path'); listing(c)
     c.add_argument('--sort-by', choices=('name','modified','date','size'), default='name')
@@ -69,7 +70,7 @@ def parser():
     cmd(g, 'stat', 'fs.stat').add_argument('path')
     c = cmd(g, 'download'); c.add_argument('path'); c.add_argument('output', type=Path)
     c = cmd(g, 'upload'); c.add_argument('source', type=Path); c.add_argument('destination')
-    c.add_argument('--transfer-state', type=Path, required=True); c.add_argument('--overwrite', action='store_true')
+    c.add_argument('--transfer-state', type=Path, help='Resume state; defaults to one file per source and destination under pc/transfers/.'); c.add_argument('--overwrite', action='store_true')
     c.add_argument('--expected-sha256', default=''); c.add_argument('--yes', action='store_true')
     c.add_argument('--skip-hash', action='store_true', help='Skip PC/Vita content hashing; verify size only.')
     for a in ('mkdir','move','trash','purge'):
@@ -96,7 +97,7 @@ def parser():
         if a in ('run','compile'):c.add_argument('--repeats',type=int,default=1)
         if a=='compile':c.add_argument('--start-us',required=True)
     g = group('performance', 'CPU/FPS/memory measurements and timed watches.')
-    cmd(g,'measure').add_argument('--window-ms',type=int,required=True)
+    cmd(g,'measure').add_argument('--window-ms',type=int,default=1000,help='Measurement window, 100..60000 ms (default 1000).')
     cmd(g,'watch').add_argument('--seconds',type=int,required=True)
     cmd(g,'cancel','performance.cancel')
     g = group('livearea', 'Read-only Shell layout, schema and blobs.')
@@ -116,7 +117,7 @@ def parser():
     cmd(g,'sync').add_argument('--output',type=Path,required=True)
     g=group('config','Guarded tai/config.txt review and verified apply.')
     c=cmd(g,'plan');c.add_argument('path');c.add_argument('candidate',type=Path);c.add_argument('--plan',type=Path,required=True)
-    c=cmd(g,'apply');c.add_argument('--plan',type=Path,required=True);c.add_argument('--transfer-state',type=Path,required=True);c.add_argument('--yes',action='store_true')
+    c=cmd(g,'apply');c.add_argument('--plan',type=Path,required=True);c.add_argument('--transfer-state',type=Path,help='Resume state; defaults to one file per plan under pc/transfers/.');c.add_argument('--yes',action='store_true')
     g=group('content','Native content inventory, export and guarded deletion.')
     c=cmd(g,'list','content.list');c.add_argument('category');listing(c)
     c=cmd(g,'export');c.add_argument('category',choices=('photo','music','video'));c.add_argument('id');c.add_argument('--output',type=Path,required=True)
@@ -147,8 +148,24 @@ def parser():
     return p
 
 
+FAILURES=None
+
+
 def emit(value):
     print(json.dumps(value,ensure_ascii=False,separators=(',',':')),flush=True)
+    if FAILURES is not None and isinstance(value,dict) and value.get('status') in ('error','client_error','unconfirmed'):
+        record_failure(value)
+
+
+def record_failure(value):
+    # A failed command leaves a local trace even when its output was discarded.
+    try:
+        if FAILURES.exists() and FAILURES.stat().st_size>1048576:os.replace(FAILURES,FAILURES.with_name('failures.1.jsonl'))
+        fd=os.open(FAILURES,os.O_WRONLY|os.O_APPEND|os.O_CREAT|os.O_NOFOLLOW,0o600)
+        with os.fdopen(fd,'a',encoding='utf-8') as f:
+            f.write(json.dumps({'at':time.strftime('%Y-%m-%dT%H:%M:%S%z'),'argv':sys.argv[1:],'result':value},ensure_ascii=False)+'\n')
+    except OSError:
+        pass
 
 
 def read_json(path):
@@ -240,6 +257,11 @@ def execute(a,c,emit_result=emit):
             time.sleep(1)
             result=c.call('app.install.status',{'operation_id':args['operation_id']})
         return result
+    if a.op in ('screen.on','screen.off'):
+        r=c.call(a.op,{})
+        # An explicit screen on stays on across later commands until screen off.
+        if r.get('status')=='accepted':set_screen_hold(c.path,a.op=='screen.on')
+        return r
     if a.op:return c.call(a.op,native_args(a))
     g,action=a.group,a.action
     if g=='call':return c.call(a.operation,strict_json(a.args.encode()))
@@ -250,6 +272,7 @@ def execute(a,c,emit_result=emit):
     if g=='screen':
         def capture(stream):
             data,meta=c.frame();stream.write(data);return len(data),meta
+        a.output=a.output or Path(time.strftime('vita-capture-%Y%m%d-%H%M%S.jpg'))
         (size,meta),replaced=write_output(a.output,capture)
         result={'status':'ok','file':str(a.output),'bytes':size,**meta}
         if replaced:result['replaced']=True
@@ -263,7 +286,7 @@ def execute(a,c,emit_result=emit):
             if replaced:result['replaced']=True
             return result
         from upload import upload
-        return upload(c,a.source,a.destination,a.transfer_state,a.overwrite,a.expected_sha256,a.yes,progress=emit_result,skip_hash=a.skip_hash)
+        return upload(c,a.source,a.destination,a.transfer_state or transfer_state(a,a.source.resolve(),a.destination),a.overwrite,a.expected_sha256,a.yes,progress=emit_result,skip_hash=a.skip_hash)
     if g in ('macro','touch','input'):
         from macro_runner import MacroRunner
         runner=MacroRunner(c,a.macro_store or a.state.parent/'macros')
@@ -315,7 +338,7 @@ def execute(a,c,emit_result=emit):
         return r
     if g=='config':
         from tai_config import prepare,apply
-        return prepare(c,a.path,a.candidate,a.plan) if action=='plan' else apply(c,a.plan,a.transfer_state,a.yes)
+        return prepare(c,a.path,a.candidate,a.plan) if action=='plan' else apply(c,a.plan,a.transfer_state or transfer_state(a,a.plan.resolve(),'config'),a.yes)
     if g=='content':
         if action=='export':
             from content import export_media
@@ -394,6 +417,13 @@ def connection_options(options):
     return result
 
 
+def transfer_state(a,source,destination):
+    # One file per source and destination, so rerunning the same command resumes.
+    folder=a.state.parent/'transfers'
+    folder.mkdir(mode=0o700,exist_ok=True)
+    return folder/(hashlib.sha256((str(source)+'\0'+destination).encode()).hexdigest()[:24]+'.json')
+
+
 def main(argv=None):
     p=parser();a=p.parse_args(argv)
     if getattr(a,'page',None) is not None and getattr(a,'limit',None) is None:p.error('--page requires --limit')
@@ -408,6 +438,8 @@ def main(argv=None):
         if a.device_dir:
             a.credentials=a.credentials or a.device_dir/'pc/credentials.json'
             a.state=a.state or a.device_dir/'pc/state.json'
+        global FAILURES
+        if a.state:FAILURES=a.state.parent/'failures.jsonl'
         if a.group=='diagnostics':
             from diagnose_vita import query
             host=a.host or a.vita_ip or (private_json(a.credentials)['host'] if a.credentials else None)

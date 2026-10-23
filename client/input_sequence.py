@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Validate readable timed state changes without silently changing semantics."""
+"""Validate readable timed state changes, merging events that share a timestamp."""
 from copy import deepcopy
 BUTTONS = {'SELECT', 'START', 'UP', 'RIGHT', 'DOWN', 'LEFT', 'L', 'R',
            'TRIANGLE', 'CIRCLE', 'CROSS', 'SQUARE'}
@@ -10,24 +10,14 @@ def validate(events, duration):
     if not isinstance(events, list) or not events:
         raise ValueError('Input events must be a nonempty list.')
     previous = -1
-    grouped = set()
-    states = 0
     for event in events:
-        if not isinstance(event, dict) or set(event) - (CHANNELS | {'at_us'}) or 'at_us' not in event or len(event) == 1:
-            raise ValueError('Readable events need at_us and at least one input channel.')
+        if not isinstance(event, dict) or set(event) - (CHANNELS | {'at_us'}) or 'at_us' not in event:
+            raise ValueError('Readable events need at_us plus any of: ' + ', '.join(sorted(CHANNELS)) + '.')
         at = event['at_us']
-        if type(at) is not int or not 0 <= at < duration or at < previous or (previous == -1 and at != 0):
-            raise ValueError('Events start at zero and use nondecreasing microsecond timestamps.')
-        channels = set(event) - {'at_us'}
-        if at == previous:
-            if channels & grouped:
-                raise ValueError('Same-timestamp events cannot both change the same channel.')
-            grouped |= channels
-        else:
-            states += 1
-            grouped = channels
-        if states > 1024:
-            raise ValueError('Input sequences support at most 1024 distinct timed states.')
+        if type(at) is not int or not 0 <= at < duration:
+            raise ValueError('at_us must be a microsecond offset from 0 to below duration_us (%d).' % duration)
+        if at < previous:
+            raise ValueError('at_us must not decrease: %d comes after %d.' % (at, previous))
         previous = at
         if 'buttons' in event:
             buttons = event['buttons']
@@ -53,4 +43,30 @@ def validate(events, duration):
                 if contact['id'] in ids:
                     raise ValueError('Duplicate finger id within a panel.')
                 ids.add(contact['id'])
-    return deepcopy(events)
+    return merge(deepcopy(events))
+
+
+def merge(events):
+    """One state per timestamp: events at the same at_us combine, events naming
+    no channel are dropped, and a sequence that starts after 0 begins from the
+    neutral state the pad already has. Two different values for one channel at
+    the same moment would hide one of them (a press and release at once is no
+    tap), so that is refused."""
+    merged = []
+    for event in events:
+        if len(event) == 1:
+            continue
+        if merged and merged[-1]['at_us'] == event['at_us']:
+            for key in set(event) & set(merged[-1]) - {'at_us'}:
+                if merged[-1][key] != event[key]:
+                    raise ValueError('%s is set to %s and %s at the same at_us %d, so one would never happen. '
+                                     'Put the second change at a later at_us (a tap needs its release about 50000 us after the press).'
+                                     % (key, merged[-1][key], event[key], event['at_us']))
+            merged[-1].update(event)
+        else:
+            merged.append(event)
+    if not merged or merged[0]['at_us'] != 0:
+        merged.insert(0, {'at_us': 0, 'buttons': []})
+    if len(merged) > 1024:
+        raise ValueError('Input sequences support at most 1024 distinct timed states; this one has %d.' % len(merged))
+    return merged

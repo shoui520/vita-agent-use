@@ -5,6 +5,25 @@ import time
 from macros import MacroStore, compile_macro,compile_segments
 from vita_client import ClientError, VitaClient
 
+
+def with_defaults(args):
+    """The runner always starts 150 ms after submission, so a start field is
+    optional and replaced; repeats, lateness and duration get usual values."""
+    if not isinstance(args, dict):
+        return args
+    args = {key: value for key, value in args.items() if key not in ('start_us', 'start_delay_us')}
+    args['start_delay_us'] = 150000
+    args.setdefault('repeats', 1)
+    args.setdefault('max_lateness_us', 100000)
+    events = args.get('events')
+    if 'duration_us' not in args and isinstance(events, list) and events:
+        last = events[-1].get('at_us') if isinstance(events[-1], dict) else events[-1][0] if isinstance(events[-1], list) and events[-1] else None
+        if type(last) is int and last >= 0:
+            # Hold the final state for 100 ms so the game sees it.
+            args['duration_us'] = min(last + 100000, 3600000000)
+    return args
+
+
 class MacroRunner:
     def __init__(self, client, store):
         self.client, self.store = client, MacroStore(store)
@@ -86,6 +105,7 @@ class MacroRunner:
     def start(self, args, *, title_id=None, name='input'):
         if self.thread is not None and self.thread.is_alive():
             raise ClientError('An input job is already running.')
+        args = with_defaults(args)
         args = VitaClient._command('input.submit', args)['args']
         if title_id is None:
             self.checked(self.client.call('input.acquire'), 'accepted')

@@ -7,6 +7,7 @@ cannot issue grants, approve operations or bypass the Vita policy engine.
 from __future__ import annotations
 import argparse
 from contextlib import contextmanager
+from errors import annotate, path_reason
 import fcntl
 import hashlib
 import hmac
@@ -225,8 +226,30 @@ def connection_refused_message(port=None):
             'session connect. '+connection_setup_hint())
 
 
+APPEND_ONLY_LOGS = ('ur0:data/vita-agent-use/runtime.log', 'ur0:data/vita-agent-use/loader.log')
+
+
+def screen_hold_path(state_path):
+    return Path(state_path).with_name('screen-hold')
+
+
+def set_screen_hold(state_path, held):
+    """Record an explicit screen on, which automatic cleanup then leaves alone."""
+    path = screen_hold_path(state_path)
+    if held:
+        os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600))
+    else:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def screen_off_if_idle(client):
     """Leave the display on until applications and outstanding work are idle."""
+    path=getattr(client,'path',None)
+    if path is not None and screen_hold_path(path).exists():
+        return False
     busy=getattr(client,'automatic_screen_busy',None)
     if busy is not None and busy():
         return False
@@ -260,7 +283,7 @@ class UploadError(ClientError):
         total = progress.get('bytes') or 'unknown'
         super().__init__(f"Upload failed during {progress.get('phase', 'unknown')}: {message}. "
                          f"Confirmed bytes: {count}/{total}. "
-                         'Rerun the identical command with the same --transfer-state file to resume; '
+                         'Rerun the identical command (with the same --transfer-state file, if you gave one) to resume; '
                          'do not change the source or operation ID.')
 
     def as_result(self):
@@ -1146,8 +1169,14 @@ class VitaClient:
                     except (ValueError, UnicodeError):
                         detail = None
                     code = detail.get('code') if isinstance(detail, dict) else None
-                    reason = {403: 'denied by the Vita file policy', 500: 'the path does not exist or could not be read'}.get(response.status, 'rejected')
-                    raise FileReadRejected('File read %s (HTTP %d, native code %s).' % (reason, response.status, code), response.status, code)
+                    if response.status == 403:
+                        reason = 'denied by file policy. ' + path_reason(json.loads(payload)['path'], write=False)
+                    elif type(code) is int and code & 0xffffffff == 0x80010002:
+                        reason = 'failed: no such file on the Vita.'
+                    else:
+                        reason = {500: 'failed: the path does not exist or could not be read.'}.get(response.status, 'rejected.')
+                    shown = '0x%08X' % (code & 0xffffffff) if type(code) is int and code < -9 else code
+                    raise FileReadRejected('File read %s (HTTP %d, native code %s)' % (reason, response.status, shown), response.status, code)
                 if response.headers.get('Content-Type', '').lower() != 'application/octet-stream':
                     raise ClientError('Unexpected file response content type.')
                 metadata = {}
@@ -1331,25 +1360,41 @@ class VitaClient:
                 raise
 
     def download(self, path, output, progress=None):
-        """Stream to a new private host file; remove incomplete output on failure."""
+        """Stream to a new private host file; remove incomplete output on failure.
+        A file that changes mid-download is fetched again from the start, up to
+        three times. The plugin's own logs only ever grow, and grow while being
+        read, so they are read up to the size they had when the download began."""
         self._command('fs.stat', {'path': path})
+        growing = path.lower() in APPEND_ONLY_LOGS
         fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        offset, revision, reported = 0, None, 0.0
+        reported = 0.0
         try:
             with os.fdopen(fd, 'wb') as stream:
-                while True:
-                    data, metadata = self.file_chunk(path, offset)
-                    current = (metadata['file_bytes'], metadata['modified'])
-                    if revision is not None and current != revision:
-                        raise ClientError('File changed during download.')
-                    revision = current
-                    stream.write(data)
-                    offset += len(data)
-                    if progress is not None and (time.monotonic()-reported>=1 or offset==metadata['file_bytes']):
-                        progress({'status':'progress','result':{'phase':'download','received':str(offset),'bytes':str(metadata['file_bytes'])}})
-                        reported=time.monotonic()
-                    if offset == metadata['file_bytes']:
+                for attempt in range(3):
+                    stream.seek(0)
+                    stream.truncate()
+                    offset, revision, size, changed = 0, None, None, False
+                    while True:
+                        data, metadata = self.file_chunk(path, offset)
+                        current = (metadata['file_bytes'], metadata['modified'])
+                        size = current[0] if size is None else size
+                        if revision is not None and current != revision and not (growing and current[0] >= size):
+                            changed = True
+                            break
+                        revision = current
+                        data = data[:size - offset]
+                        stream.write(data)
+                        offset += len(data)
+                        if progress is not None and (time.monotonic()-reported>=1 or offset==size):
+                            progress({'status':'progress','result':{'phase':'download','received':str(offset),'bytes':str(size)}})
+                            reported=time.monotonic()
+                        if offset == size:
+                            break
+                    if not changed:
                         break
+                else:
+                    raise ClientError('File kept changing during download (3 tries). Something on the Vita is still writing it; '
+                                      'wait for that to finish or close the app writing it, then download again.')
                 stream.flush()
                 os.fsync(stream.fileno())
         except BaseException:
@@ -1638,7 +1683,7 @@ class VitaClient:
                 installs.add(operation_id)
             self._screen_installs=installs
         self._track_screen_reply(op,result)
-        return result
+        return annotate(op,args,result)
 
     def _track_screen_reply(self,op,result):
         if result.get('status')!='accepted':
