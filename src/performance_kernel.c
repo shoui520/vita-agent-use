@@ -38,6 +38,77 @@ static int display_hook(int h, int plane, const SceDisplayFrameBuf *fb, int sync
 	return rc;
 }
 
+/* Seen from a Shell thread, the sysroot address space is a table of slots
+ * 0x1000 apart, one per process address space; switching the MMU context does
+ * not change it. Each slot holds partition pointers at these offsets:
+ * USER_RW, CDRAM, PHYCONT, CDLG. Same layout PSVshellPlus reads. */
+#define SPACE_SLOTS  7
+#define SPACE_STRIDE 0x1000u
+#define PART_TYPE    0x14u
+#define PART_NAME    0x8cu
+#define TYPE_SYSTEM  0x10002u /* Main memory owned by the system (SceShell) */
+#define TYPE_GAME    0x10004u /* Main memory owned by the game */
+
+/* Host tests map partition addresses into their own buffers. */
+#ifndef PART_PTR
+#define PART_PTR(a) (a)
+#endif
+
+static const unsigned offsets[] = { 328, 332, 316, 324 };
+
+static int valid_part(uintptr_t part)
+{
+	return part > 0x1000 && part < 0x1000000 && !(part & 3);
+}
+
+static int name_has(const char *name, const char *title)
+{
+	size_t n = 0;
+
+	while (n < 12 && title[n])
+		n++;
+	if (!n)
+		return 0;
+	for (size_t i = 0; i + n <= 32 && name[i]; i++) {
+		if (!memcmp(name + i, title, n))
+			return 1;
+	}
+
+	return 0;
+}
+
+/* The slot whose main partition belongs to the foreground process: SceShell's
+ * is system-owned, an app's is named after its title, and the game's is
+ * game-owned. Returns 0 when none matches. */
+static uintptr_t find_space(uintptr_t table, int shell, const char *title)
+{
+	uintptr_t game = 0;
+
+	if (!table || (table & 3))
+		return 0;
+	for (unsigned i = 0; i < SPACE_SLOTS; i++) {
+		uintptr_t slot = table + i * SPACE_STRIDE;
+		uintptr_t part = *(const uint32_t *)(slot + offsets[0]);
+
+		if (!valid_part(part))
+			continue;
+
+		uint32_t type = *(const uint32_t *)(PART_PTR(part) + PART_TYPE);
+
+		if (shell) {
+			if (type == TYPE_SYSTEM)
+				return slot;
+			continue;
+		}
+		if (name_has((const char *)(PART_PTR(part) + PART_NAME), title))
+			return slot;
+		if (type == TYPE_GAME && !game)
+			game = slot;
+	}
+
+	return game;
+}
+
 /* Called only on demand by Shell; no hook installation at boot. */
 static int read_native(uint32_t on, VauPerformanceRaw *out)
 {
@@ -100,36 +171,23 @@ static int read_native(uint32_t on, VauPerformanceRaw *out)
 	if (out->memory_error < 0)
 		return VAU_OK;
 
-	SceKernelProcessContext *context = NULL, previous;
-	int rc                           = ksceKernelProcessGetContext(out->pid, &context);
+	uintptr_t space = find_space(vauSysrootCurrentAddressSpace(),
+	                             out->pid == ksceKernelSysrootGetShellPid(), out->title);
+	int rc          = space ? VAU_OK : VAU_UNSUPPORTED;
 
-	if (rc >= 0 && !context)
-		rc = VAU_DEVICE_ERROR;
-	if (rc >= 0)
-		rc = ksceKernelProcessSwitchContext(context, &previous);
-	if (rc < 0) {
-		out->memory_error = rc;
-		return VAU_OK;
-	}
-
-	uintptr_t cas                   = vauSysrootCurrentAddressSpace();
-	static const unsigned offsets[] = { 328, 332, 316, 324 };
-
-	if (!cas || (cas & 3))
-		rc = VAU_UNSUPPORTED;
 	for (unsigned i = 0; i < 4 && rc >= 0; i++) {
-		uintptr_t part = *(const uint32_t *)(cas + offsets[i]);
+		uintptr_t part = *(const uint32_t *)(space + offsets[i]);
 
 		if (!part)
 			continue; /* No partition allocated for this process. */
-		if (part <= 0x1000 || part >= 0x1000000 || (part & 3)) {
+		if (!valid_part(part)) {
 			rc = VAU_UNSUPPORTED;
 			break;
 		}
 
 		struct partition_info info = { 0 };
 
-		rc = vauGetPhyMemPartInfo((void *)part, &info);
+		rc = vauGetPhyMemPartInfo((void *)PART_PTR(part), &info);
 		if (rc >= 0 && info.free > info.total)
 			rc = VAU_DEVICE_ERROR;
 		if (rc >= 0) {
@@ -138,9 +196,7 @@ static int read_native(uint32_t on, VauPerformanceRaw *out)
 		}
 	}
 
-	int restored = ksceKernelProcessSwitchContext(&previous, NULL);
-
-	out->memory_error = restored < 0 ? restored : rc;
+	out->memory_error = rc;
 	return VAU_OK;
 }
 
