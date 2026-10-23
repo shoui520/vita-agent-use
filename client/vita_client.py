@@ -1188,7 +1188,9 @@ class VitaClient:
                 modified = response.headers.get_all('X-Vita-Modified', [])
                 if len(modified) != 1 or not re.fullmatch(r'[0-9]{1,5}-[0-9]{1,5}-[0-9]{1,5}T[0-9]{1,5}:[0-9]{1,5}:[0-9]{1,5}\.[0-9]{1,10}', modified[0]):
                     raise ClientError('Invalid file modification metadata.')
-                metadata['modified'] = modified[0]
+                # The plugin sends this header unpadded; match every other Vita timestamp.
+                parts = [int(p) for p in re.split('[-T:.]', modified[0])]
+                metadata['modified'] = '%04d-%02d-%02dT%02d:%02d:%02d.%06d' % tuple(parts)
                 if metadata['offset'] != offset or offset > metadata['file_bytes'] or len(data) != min(length, metadata['file_bytes'] - offset):
                     raise ClientError('File response does not match the requested range.')
                 self.last_exchange = time.monotonic()
