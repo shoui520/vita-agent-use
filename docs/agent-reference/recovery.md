@@ -67,6 +67,7 @@ Large negative numbers are Sony codes, not these. Keep both the signed decimal a
 | Screen off | Normal access wakes it. Check the evidence before blaming the display. |
 | `frame_unavailable` | Captures retry for 3 s by themselves. If it persists, report it; wait about 2 s after a launch or wake and capture again. Never fake a frame. |
 | Output path already exists | Captures and downloads replace an existing file atomically and report `replaced:true`. Directories and symlinks are refused; choose another path. |
+| "File kept changing during download", or a file read that "changed while it was being read" (native `-5`) or "shrank or was replaced" | Something on the Vita is writing the file; the plugin refuses a chunk whose size or modification time changed while it read it. For a log a running app appends to, use `fs download --live`. For any other file, wait for the writer to finish or close the app, then download again. |
 | Launch accepted but wrong or no title in foreground | Unconfirmed. Check `app running`, the snapshot, dialog events and a capture, and handle any dialog with the user. Never bypass the confirmation. |
 | VPK still installing | Query the same ID. Never start overlapping installs or free resources the installer is using. |
 | ACL pending or denied | Wait for the physical decision and query the same ID. Only `approved` grants access. |

@@ -69,6 +69,7 @@ def parser():
     c.add_argument('--human', action='store_true', help='Print filename, modification date and size as a table.')
     cmd(g, 'stat', 'fs.stat').add_argument('path')
     c = cmd(g, 'download'); c.add_argument('path'); c.add_argument('output', type=Path)
+    c.add_argument('--live', action='store_true', help="Read a file that is still being appended to, such as a running app's log, up to its size when the download began.")
     c = cmd(g, 'upload'); c.add_argument('source', type=Path); c.add_argument('destination')
     c.add_argument('--transfer-state', type=Path, help='Resume state; defaults to one file per source and destination under pc/transfers/.'); c.add_argument('--overwrite', action='store_true')
     c.add_argument('--expected-sha256', default=''); c.add_argument('--yes', action='store_true')
@@ -281,7 +282,7 @@ def execute(a,c,emit_result=emit):
         if action=='download':
             fd,temp=create_output(a.output);os.close(fd);temp.unlink()
             replaced=Path(a.output).exists()
-            result=c.download(a.path,temp)
+            result=c.download(a.path,temp,live=getattr(a,'live',False))
             os.replace(temp,a.output);result['file']=str(a.output)
             if replaced:result['replaced']=True
             return result

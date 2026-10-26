@@ -227,6 +227,8 @@ def connection_refused_message(port=None):
 
 
 APPEND_ONLY_LOGS = ('ur0:data/vita-agent-use/runtime.log', 'ur0:data/vita-agent-use/loader.log')
+# Times a growing file's chunk is read again after a write landed mid-read.
+CHUNK_REREADS = 10
 
 
 def screen_hold_path(state_path):
@@ -307,6 +309,10 @@ class FileReadRejected(ClientError):
     def __init__(self, message, status, code):
         super().__init__(message)
         self.status, self.code = status, code
+
+
+class FileChangedError(FileReadRejected):
+    """The file changed while a chunk was read (written, shrunk or replaced)."""
 
 
 class NativeFrameError(ClientError):
@@ -1169,13 +1175,20 @@ class VitaClient:
                     except (ValueError, UnicodeError):
                         detail = None
                     code = detail.get('code') if isinstance(detail, dict) else None
+                    shown = '0x%08X' % (code & 0xffffffff) if type(code) is int and code < -9 else code
+                    # The plugin refuses a chunk whose size or modification time
+                    # changed while it read it (-5), and an offset past a file
+                    # that has since shrunk (-1).
+                    if response.status == 500 and (code == -5 or (code == -1 and offset)):
+                        reason = 'failed: the file changed while it was being read' if code == -5 else \
+                                 'failed: the file shrank or was replaced while it was being read'
+                        raise FileChangedError('File read %s (HTTP %d, native code %s)' % (reason, response.status, shown), response.status, code)
                     if response.status == 403:
                         reason = 'denied by file policy. ' + path_reason(json.loads(payload)['path'], write=False)
                     elif type(code) is int and code & 0xffffffff == 0x80010002:
                         reason = 'failed: no such file on the Vita.'
                     else:
                         reason = {500: 'failed: the path does not exist or could not be read.'}.get(response.status, 'rejected.')
-                    shown = '0x%08X' % (code & 0xffffffff) if type(code) is int and code < -9 else code
                     raise FileReadRejected('File read %s (HTTP %d, native code %s)' % (reason, response.status, shown), response.status, code)
                 if response.headers.get('Content-Type', '').lower() != 'application/octet-stream':
                     raise ClientError('Unexpected file response content type.')
@@ -1361,28 +1374,44 @@ class VitaClient:
                 self._close_transport()
                 raise
 
-    def download(self, path, output, progress=None):
+    def download(self, path, output, progress=None, live=False):
         """Stream to a new private host file; remove incomplete output on failure.
         A file that changes mid-download is fetched again from the start, up to
         three times. The plugin's own logs only ever grow, and grow while being
-        read, so they are read up to the size they had when the download began."""
+        read, so they are read up to the size they had when the download began;
+        live applies the same to any file, such as a running app's log. Growth
+        assumes appends: a file rewritten in place can mix old and new bytes."""
         self._command('fs.stat', {'path': path})
-        growing = path.lower() in APPEND_ONLY_LOGS
+        growing = live or path.lower() in APPEND_ONLY_LOGS
         fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         reported = 0.0
+        grew = False
         try:
             with os.fdopen(fd, 'wb') as stream:
                 for attempt in range(3):
                     stream.seek(0)
                     stream.truncate()
-                    offset, revision, size, changed = 0, None, None, False
+                    offset, revision, size, changed, rereads = 0, None, None, False, 0
                     while True:
-                        data, metadata = self.file_chunk(path, offset)
-                        current = (metadata['file_bytes'], metadata['modified'])
-                        size = current[0] if size is None else size
-                        if revision is not None and current != revision and not (growing and current[0] >= size):
+                        try:
+                            data, metadata = self.file_chunk(path, offset)
+                        except FileChangedError as exc:
+                            # A write that lands while the plugin reads a chunk
+                            # spoils only that chunk; a shrunk file starts over.
+                            if growing and exc.code == -5 and rereads < CHUNK_REREADS:
+                                rereads += 1
+                                grew = True
+                                continue
                             changed = True
                             break
+                        rereads = 0
+                        current = (metadata['file_bytes'], metadata['modified'])
+                        size = current[0] if size is None else size
+                        if revision is not None and current != revision:
+                            if not (growing and current[0] >= size):
+                                changed = True
+                                break
+                            grew = True
                         revision = current
                         data = data[:size - offset]
                         stream.write(data)
@@ -1396,13 +1425,17 @@ class VitaClient:
                         break
                 else:
                     raise ClientError('File kept changing during download (3 tries). Something on the Vita is still writing it; '
-                                      'wait for that to finish or close the app writing it, then download again.')
+                                      'wait for that to finish or close the app writing it, then download again.' +
+                                      ('' if growing else ' If it is a log the app only appends to, download it with --live.'))
                 stream.flush()
                 os.fsync(stream.fileno())
         except BaseException:
             os.unlink(output)
             raise
-        return {'status': 'ok', 'file': str(output), 'bytes': str(offset), 'modified': revision[1]}
+        result = {'status': 'ok', 'file': str(output), 'bytes': str(offset), 'modified': revision[1]}
+        if growing:
+            result['grew'] = grew
+        return result
 
     def _finish(self, state):
         request = state['pending']
