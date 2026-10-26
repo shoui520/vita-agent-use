@@ -95,7 +95,7 @@ python3 client/vita_agent.py fs upload ./build/data.bin ux0:data/my-app/data.bin
 python3 client/vita_agent.py fs download ux0:data/my-app/data.bin ./private-work/data-readback.bin   # compare hashes
 ```
 
-To replace an executable: `app close EXAMPLE01`, optionally back it up with `fs download`, then `fs upload ... --overwrite --yes`, read it back and compare, then `app launch`. No ACL is needed for ordinary paths. `--expected-sha256` takes the **old** file's hash, never the new source's.
+To replace an executable: `app close EXAMPLE01`, optionally back it up with `fs download`, then `fs upload ... --overwrite --yes`, read it back and compare, then `app launch`. The plugin also keeps the replaced file as a hidden `.old` copy, which no command can restore or delete, so each replacement uses the old file's size in free space ([upload storage](commands.md#fs)). No ACL is needed for ordinary paths. `--expected-sha256` takes the **old** file's hash, never the new source's.
 
 For large ordinary files, add `--skip-hash` to avoid hashing the contents on either the PC or Vita:
 
