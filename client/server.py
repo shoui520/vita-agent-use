@@ -35,6 +35,9 @@ EXTEND_MARGIN_S = 600
 # A run survives a dropped connection this long when the plugin keeps
 # session state across reconnects.
 RUN_RECONNECT_WAIT = 90
+# While a run still waits for its crash dump, check the dump files this often
+# in case the coredump.complete event was dropped.
+DUMP_CHECK_S = 10
 MAX_IPC = 1024 * 1024
 MAX_FRAME = 2 * 1024 * 1024
 TERMINAL = {'completed', 'cancelled', 'failed', 'connection_lost'}
@@ -203,6 +206,7 @@ class RunCoordinator:
     def __init__(self, server):
         self.server=server;self.guard=threading.RLock();self.active=None;self.thread=None
         self.cancel_event=threading.Event();self.completion=threading.Event();self.dump_complete=threading.Event();self.failure=None;self.watch_id=None
+        self.checked_connection=None;self.checked_at=0
         self.path=server.root/'run.json'
         if self.path.exists():
             self.active=private_json(self.path)
@@ -213,6 +217,65 @@ class RunCoordinator:
         with self.guard:return copy.deepcopy(self.active)
     def busy(self):
         with self.guard:return self.active is not None and (self.active['phase'] not in TERMINAL or self.active.get('coredump',{}).get('state')=='saving')
+    def held_dump(self):
+        """The crash dump the run still holds for: saving, with no coredump.complete yet."""
+        with self.guard:
+            dump=(self.active or {}).get('coredump') or {}
+            return dict(dump) if dump.get('state')=='saving' else None
+    def blocked_reason(self):
+        """Explain a finished run that only its unfinished dump keeps active."""
+        dump=self.held_dump()
+        with self.guard:
+            if dump is None or self.active['phase'] not in TERMINAL:return None
+            return ('Run %s finished, but its crash dump %s is still saving: no coredump.complete was received. '
+                    'Wait for it, or run `run cancel`, which checks the dump files and releases the run once the dump '
+                    'is finished or gone.'%(self.active['run_id'],dump['path']))
+    def dump_check_due(self,connection):
+        """Check a held dump's files once per connection, and every DUMP_CHECK_S
+        while the worker still waits for it."""
+        if self.held_dump() is None:return False
+        now=time.monotonic();waiting=self.thread is not None and self.thread.is_alive()
+        if connection!=self.checked_connection or (waiting and now-self.checked_at>=DUMP_CHECK_S):
+            self.checked_connection=connection;self.checked_at=now;return True
+        return False
+    @staticmethod
+    def _stat(client,path):
+        """The file's stat result, False if it does not exist, None if unknown."""
+        reply=client.call('fs.stat',{'path':path})
+        if reply.get('status')=='ok' and isinstance(reply.get('result'),dict):return reply['result']
+        error=reply.get('error') if isinstance(reply.get('error'),dict) else {}
+        code=error.get('code')
+        return False if type(code) is int and code&0xffffffff==0x80010002 else None
+    def reconcile_dump(self,client):
+        """Settle a held dump from its files when coredump.complete never came.
+        The writer renames NAME.tmp to NAME when it finishes, so no .tmp with a
+        NAME file means complete, and neither means the dump is gone. Returns
+        the dump state, 'saving' while the .tmp exists, or None if unknown."""
+        dump=self.held_dump()
+        if dump is None:return None
+        tmp=self._stat(client,dump['path'])
+        if tmp is None:return None
+        if tmp is not False:return 'saving'
+        info=self._stat(client,dump['path'].removesuffix('.tmp'))
+        if info is None:return None
+        complete=info is not False and info.get('kind')=='file'
+        return self.settle_dump(dump,'complete' if complete else 'missing','files',info.get('bytes') if complete else None)
+    def settle_dump(self,dump,state,reason,size=None):
+        """Record how a held dump ended and release the run waiting for it."""
+        final=dump['path'].removesuffix('.tmp')
+        with self.guard:
+            current=(self.active or {}).get('coredump') or {}
+            if current.get('state')!='saving' or current.get('path')!=dump['path']:return current.get('state')
+            settled={**current,'state':state,'settled_by':reason}
+            if state=='complete':settled['path']=final
+            if size is not None:settled['bytes']=size
+            self.active['coredump']=settled;durable_json(self.path,self.active)
+            self.server.saving_dumps.discard(final)
+            event={'type':'coredump.reconciled','run_id':self.active['run_id'],'path':settled['path'],'state':state,'reason':reason}
+            if size is not None:event['bytes']=size
+            self.server.event(event)
+            self.dump_complete.set()
+            return state
     @staticmethod
     def validate(spec):
         if not isinstance(spec,dict) or set(spec)-{'title_id','prepare','completion','timeout_s','performance_interval_ms','close_on_completion','yes'}:raise ClientError('Unknown run field.')
@@ -243,16 +306,32 @@ class RunCoordinator:
     def start(self,spec):
         spec=self.validate(spec)
         with self.guard:
-            if self.busy():raise ClientError('Another run is in progress.')
+            if self.busy():raise ClientError(self.blocked_reason() or 'Another run is in progress.')
             if not self.server.connected:raise ClientError('Vita event connection is unavailable.')
             self.active={'run_id':uuid.uuid4().hex,'title_id':spec['title_id'],'phase':'preparing','spec':spec,'started_at':time.time(),'error':None}
             self.cancel_event.clear();self.completion.clear();self.dump_complete.clear();self.failure=None;self.watch_id=None
             durable_json(self.path,self.active)
             self.thread=threading.Thread(target=self._worker,name='vita-run',daemon=True);self.thread.start()
             return self.status()
-    def cancel(self):
+    def cancel(self,yes=False):
+        if not self.busy():raise ClientError('No active run.')
+        dump=self.held_dump()
+        if dump is not None:
+            # A run never stops waiting for its dump on cancel alone: closing
+            # the app or the screen can abort a dump that is still being written.
+            state=None;problem=''
+            try:
+                with self.server.rpc_guard,recovery_limit(self.server.client,15):state=self.reconcile_dump(self.server.client)
+            except ClientError as exc:problem=' ('+str(exc)+')'
+            if state=='saving' and not yes:
+                raise ClientError('Crash dump %s is still being written: its .tmp file exists. Wait for coredump.complete. '
+                                  'If the Vita rebooted or crashed since, the .tmp will never finish; then rerun with '
+                                  '`run cancel --yes` to release the run and mark the dump abandoned.'%dump['path'])
+            if state is None and not yes:
+                raise ClientError('Could not check whether crash dump %s finished%s. Retry once the Vita is connected, or, '
+                                  'if it rebooted since the crash, use `run cancel --yes`.'%(dump['path'],problem))
+            if state in ('saving',None):self.settle_dump(dump,'abandoned','run cancel --yes')
         with self.guard:
-            if not self.busy():raise ClientError('No active run.')
             self.cancel_event.set();self.completion.set();return self.status()
     def on_event(self,event):
         with self.guard:
@@ -593,6 +672,9 @@ class AgentServer:
             if expired(120) and self.renewer is not None and not self.runs.busy():
                 # Older plugins cannot extend: renew while idle, not mid-command.
                 self.renewer.renew_now(client);self.ensure_connected();return
+        if self.runs.dump_check_due((self.reconnects,self.subscribed_token)):
+            # Its coredump.complete may have been dropped or lost with the connection.
+            self.runs.reconcile_dump(client)
         if self.features.get('ping') and time.monotonic()-(getattr(client,'last_exchange',0) or 0)>=HEARTBEAT_S:
             client.call('session.ping')
 
@@ -657,7 +739,7 @@ class AgentServer:
                     except ClientError as exc:raise ClientError('Vita event connection is unavailable: '+str(exc)) from exc
             return {'status':'ok','result':self.runs.start(args)}
         if method=='run.status':return {'status':'ok','result':self.runs.status()}
-        if method=='run.cancel':return {'status':'ok','result':self.runs.cancel()}
+        if method=='run.cancel':return {'status':'ok','result':self.runs.cancel(yes=args.get('yes') is True)}
         if method=='performance.start':
             if self.runs.busy():raise ClientError('Performance is controlled by the active run.')
             VitaClient._command('performance.watch',args)
@@ -692,7 +774,7 @@ class AgentServer:
                 if values.get(field) is not None:values[field]=Path(values[field])
             options=argparse.Namespace(**values)
             options._cancel=cancel
-            if self.runs.busy() and (options.group in ('app','input','touch','macro','config','content','decrypt') or (options.group=='screen' and options.action!='capture') or (options.group=='fs' and options.action not in ('list','stat','download')) or options.group in ('call','session','performance')):raise ClientError('This command conflicts with the active run; status, events, metadata and captures remain available.')
+            if self.runs.busy() and (options.group in ('app','input','touch','macro','config','content','decrypt') or (options.group=='screen' and options.action!='capture') or (options.group=='fs' and options.action not in ('list','stat','download')) or options.group in ('call','session','performance')):raise ClientError(self.runs.blocked_reason() or 'This command conflicts with the active run; status, events, metadata and captures remain available.')
             with self.rpc_guard:
                 client=self.client
                 if isinstance(getattr(client,'notices',None),list):client.notices=[]

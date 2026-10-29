@@ -138,8 +138,8 @@ Details are in events-runs.md.
 - **server performance-start** `--seconds 1..3600 [--interval-ms 100..min(60000,duration)]`: pushed `performance.sample` events. Only one measurement can run, and an active run owns it.
 - **server performance-stop**: stops metrics not owned by a run; keeps the events already collected.
 - **run start** `FILE [--yes]`: starts a run in the background and returns `run_id` immediately. `--yes` is needed for install or overwrite. One run per server.
-- **run status**: the PC coordinator record. `failed: coredump` with `coredump.state=complete` is a correctly detected crash. A dump that is still saving blocks new runs, even after `connection_lost`.
-- **run cancel**: asynchronous; wait for `run.finished`. Still waits for any dump to finalize.
+- **run status**: the PC coordinator record. `failed: coredump` with `coredump.state=complete` is a correctly detected crash. A dump that is still saving blocks new runs and conflicting commands, even after `connection_lost`, until it is settled. A dump settled without its `coredump.complete` event adds `settled_by` (`files`, or `run cancel --yes`) and, for a finished dump, `bytes`; its `state` is `complete`, `missing` or `abandoned`.
+- **run cancel** `[--yes]`: asynchronous; wait for `run.finished`. It does not stop the run from waiting for a dump that is still being written. If a dump is still saving, cancel first checks the dump files: a finished or deleted dump is settled and releases the run. While the `.tmp` file still exists, or the files cannot be checked, cancel refuses. `--yes` then releases the run anyway and marks the dump `abandoned`; use it only when the dump writer is gone, for example after the Vita rebooted or powered off following the crash, never while it may still be writing.
 
 ## call
 

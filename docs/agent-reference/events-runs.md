@@ -31,6 +31,7 @@ The server keeps its connection alive by itself:
 | `log.resumed` / `log.interrupted` | A log watch was re-armed under its original `watch_id` after a new session, or could not be. |
 | `coredump.saving` | A new `.psp2dmp.tmp` appeared. Record it and wait. |
 | `coredump.complete` | Renamed to the final `.psp2dmp`. Match it to the saving event and keep the full path. |
+| `coredump.reconciled` | The server settled a saving dump from its files because `coredump.complete` never arrived (`reason: files`), or `run cancel --yes` abandoned it. `state` is `complete` (with `path` and `bytes`), `missing` (no `.tmp` and no final file) or `abandoned`. A dump completed this way may be truncated if the Vita hung or lost power while writing it. |
 | `dialog.error` | Error callback. Keep the code/hex; it does not prove a dialog was shown. |
 | `tty.data` | Automatically captured kernel/user printf output, with `source`, `pid`, native timestamp, lossless hex `data` and a readable `text` preview. |
 | `log.data` | Hex-encoded appended bytes with watch ID, path and offset. Decode on the host and handle chunk boundaries. |
@@ -85,6 +86,8 @@ Without `completion`, the run waits for cancel, a coredump, a lost session or th
 Use a run without `completion` (for example, `timeout_s` 600 with metrics) and let the user play until the app crashes. On `coredump.saving`, automation stops, and the run **must not** close the app, turn off the screen or end the native run until the matching completion arrives. The result is `failed` with error `coredump` and a complete dump path. That counts as a successful crash-detection test. Cleanup destroys the app by title even if its process is gone, because Shell can keep the app context alive.
 
 Check `run status`, `run.finished` and `cleanup_errors`. `run cancel` during a dump also waits. If the connection drops, keep the saving record and let it reconnect; start no new run and do not force a reboot. If the final event arrives after the worker has exited, verify cleanup and finish anything left only after the dump is complete.
+
+The `coredump.complete` event can be lost: the Vita can hang or power off after the crash, the connection can drop before the event is pushed, or the native ring can drop it. The run would then stay active forever, so the server checks the dump files itself. It does this once after every (re)connection and at startup, and every 10 s while the run is still waiting for its dump. When the `.tmp` file is gone, the final file means the dump finished and no final file means it is gone. The dump is then settled, the run is released and the server emits `coredump.reconciled`. While the `.tmp` file still exists the dump counts as saving, because nothing on the PC can tell a slow writer from one that died in a reboot. If the Vita rebooted or lost power after the crash, that `.tmp` will never finish: confirm that with the user, then release the run with `run cancel --yes`.
 
 ## Performance
 

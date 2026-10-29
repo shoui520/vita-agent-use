@@ -45,6 +45,7 @@ PY
 |---|---|
 | `coredump.saving` | The app crashed and the `.psp2dmp.tmp` is still being written. Tell the user. Stop sending input, and do not close the app, reboot or turn the screen off. |
 | `coredump.complete` | The final `.psp2dmp` path, which is the saving path without `.tmp`. Download and analyze it now. |
+| `coredump.reconciled` | The complete event was lost, so the server settled the dump from its files. With `state: complete`, download and analyze `path`; it may be truncated if the Vita hung or lost power. `missing` means no dump file survived; `abandoned` means `run cancel --yes` released it. |
 | `connection.lost` / `connection.ready` | Dumps can be missed while disconnected. Treat the gap as unobserved. |
 | `events.overflow`, `GAP` | Dump observations were lost. Report the gap, and never fill it in. |
 | `MONITOR STOPPED` | `serve` is gone or unreachable, so crash detection is off. Restart `serve`, then re-arm the monitor. |

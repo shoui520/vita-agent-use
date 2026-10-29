@@ -143,7 +143,8 @@ def parser():
     cmd(g,'performance-stop')
     g=group('run','Asynchronous prepare, launch, observe and close workflows.')
     c=cmd(g,'start');c.add_argument('file',type=Path);c.add_argument('--yes',action='store_true')
-    cmd(g,'status');cmd(g,'cancel')
+    cmd(g,'status');c=cmd(g,'cancel')
+    c.add_argument('--yes',action='store_true',help='Also release a run whose crash dump never finished, such as after a reboot, and mark the dump abandoned.')
     c=groups.add_parser('call',help='Low-level JSON operation escape hatch.')
     c.set_defaults(action='call',op=None);c.add_argument('operation');c.add_argument('--args',default='{}')
     return p
@@ -523,7 +524,7 @@ def main(argv=None):
         if a.group in ('server','run'):
             if a.group=='run':
                 method='run.'+a.action
-                args=read_json(a.file) if a.action=='start' else {}
+                args=read_json(a.file) if a.action=='start' else {'yes':a.yes} if a.action=='cancel' else {}
                 if a.action=='start':
                     if not isinstance(args,dict):raise ClientError('Run file must contain an object.')
                     if 'yes' in args:raise ClientError('Express installation/overwrite intent with run start --yes.')

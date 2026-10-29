@@ -24,7 +24,7 @@ Skills for external tools: [vita-perf](docs/vita-perf/SKILL.md) (CPU profiling w
 - **Humans approve.** Agent input cannot approve pairing, ACL or Content Manager dialogs. Tell the human which prompt to approve and wait for their physical OK. Send no button or touch input while approval is pending.
 - **PS+SELECT means stop.** The plugin revokes control and shows **"Agent stopped."** Do not reconnect or resume input until the user authorizes it.
 - **Ordinary input has no title binding; saved macros do.** Never add a title ID to `input acquire` or readable input events.
-- **Crash dumps:** after `coredump.saving`, wait for the matching `coredump.complete`. A `.psp2dmp.tmp` file is still being written; closing the app, rebooting or turning the screen off can interrupt it.
+- **Crash dumps:** after `coredump.saving`, wait for the matching `coredump.complete`, or `coredump.reconciled` when that event was lost. A `.psp2dmp.tmp` file is still being written; closing the app, rebooting or turning the screen off can interrupt it.
 - **Destruction needs consent.** Never run destructive tests against protected paths. This workspace requires explicit user approval before any on-device Content Manager deletion test. `--yes` records intent; it does not replace approval.
 - **Show full listings.** The CLI returns every entry by default; never abbreviate silently. Use `--limit` only when the user asks or the 1 MiB IPC reply limit forces it, and then say so.
 - **Prefer native operations.** Generic file access does not update the native content registry. Do not edit databases or delete managed content by hand. Do not fabricate commands, CLI flags or `call` names: confirm in the CLI's command handling, the native capability or error response, and the observed result.
