@@ -2,6 +2,8 @@
 
 ## Receiving events
 
+Arm `serve` at the start of every session, not only for runs. It is the only receiver for crash dumps, TTY output, error dialogs and log watches; nothing the Vita pushes while it is down can be recovered later. Keep a background watcher on `server events` for `coredump.*`, `dialog.error`, `events.overflow`, `connection.*` and the relevant `tty.data` (see the vita-coredump skill's monitor).
+
 Start `serve` in a long-lived process, then from another shell:
 
 ```sh
@@ -17,7 +19,7 @@ The server keeps its connection alive by itself:
 
 - After 15 s without traffic it sends a background `session.ping`, so the 30-minute idle limit never closes a served connection.
 - Ten minutes before the one-hour expiry it calls `session.extend`, which keeps the same token, replay cache and watches. Plugins without it are renewed from the saved pairing while idle, two minutes before expiry; this needs `device_dir`.
-- A lost connection is reconnected with a backoff of at most 15 s. A connection that returns within the plugin's 5-minute grace (`features.connection_grace_us`) resumes the same session: watches, pushed performance and the run carry on, with `connection.ready` `resumed: true`.
+- A lost connection is reconnected with a backoff of at most 15 s. The TCP connect of each attempt gets 5 s (the TLS handshake keeps 60 s, since it can wait behind the Vita retiring a dead connection): a rebooting Vita silently drops connection requests, and one long connect would back off its own retransmissions and notice the Vita's return up to a minute late. A connection that returns within the plugin's 5-minute grace (`features.connection_grace_us`) resumes the same session: watches, pushed performance and the run carry on, with `connection.ready` `resumed: true`.
 - When the Vita no longer holds the session (reboot, expiry, plugin restart, a new admission), the server renews it from the saved pairing, emits `session.renewed`, re-subscribes, re-arms log watches under their original `watch_id` (`log.resumed`, from the end of the file; bytes written in the gap are not replayed) and restarts server-started performance recording. A watch that cannot be re-armed emits `log.interrupted`.
 - A pending command never blocks reconnection: it is replayed with its original ID, or recorded as unresolved if its session ended (`command.recovered` / `command.unresolved` events).
 

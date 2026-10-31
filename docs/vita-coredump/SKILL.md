@@ -35,7 +35,7 @@ while True:
     if r['lost']: print('GAP: %d events after %d left server memory; search %s' % (r['lost'], cursor, r['journal']))
     for e in r['events']:
         t = e.get('type', '')
-        if t.startswith(('coredump.', 'connection.')) or (t == 'events.overflow' and e.get('source') in (None, 'coredump.batch')):
+        if t.startswith(('coredump.', 'connection.')) or t == 'dialog.error' or (t == 'events.overflow' and e.get('source') in (None, 'coredump.batch')):
             print(json.dumps(e, separators=(',', ':')))
     cursor = r['next']; state.parent.mkdir(parents=True, exist_ok=True); state.write_text(str(cursor))
 PY
@@ -47,6 +47,7 @@ PY
 | `coredump.complete` | The final `.psp2dmp` path, which is the saving path without `.tmp`. Download and analyze it now. |
 | `coredump.reconciled` | The complete event was lost, so the server settled the dump from its files. With `state: complete`, download and analyze `path`; it may be truncated if the Vita hung or lost power. `missing` means no dump file survived; `abandoned` means `run cancel --yes` released it. |
 | `connection.lost` / `connection.ready` | Dumps can be missed while disconnected. Treat the gap as unobserved. |
+| `dialog.error` | A system error dialog callback fired. Keep `code`/`raw_hex`, look it up with the vita-err skill, and capture the screen to confirm it was shown. |
 | `events.overflow`, `GAP` | Dump observations were lost. Report the gap, and never fill it in. |
 | `MONITOR STOPPED` | `serve` is gone or unreachable, so crash detection is off. Restart `serve`, then re-arm the monitor. |
 

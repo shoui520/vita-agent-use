@@ -17,7 +17,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
-from vita_client import durable_json, private_json, ClientError, VitaClient, validate_host, validate_agent_name, connection_setup_hint, connection_refused_message, ensure_private, archive_pending, LOCK_WAIT, NotSentError
+from vita_client import durable_json, private_json, ClientError, VitaClient, validate_host, validate_agent_name, connection_setup_hint, connection_refused_message, ensure_private, archive_pending, LOCK_WAIT, NotSentError, open_tcp
 
 BASE=Path.home()/'.local/share/vita-agent-use'
 
@@ -112,6 +112,7 @@ def pair_locked(resume=False, *, host=None, agent_name=None, timeout=75, on_arch
     context.set_ciphers('ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256')
     context.load_cert_chain(config['client_certificate'],config['client_key'])
     connection=http.client.HTTPSConnection(config['host'],config['port'],context=context,timeout=timeout)
+    connection._create_connection=open_tcp
     started_at=time.time()
     try:
         connection.connect()

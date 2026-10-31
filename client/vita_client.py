@@ -30,6 +30,12 @@ from input_sequence import validate as validate_readable_events
 # A TCP connect plus TLS handshake may wait behind the Vita retiring a dead
 # connection (up to 30 s), so allow well beyond that before giving up.
 CONNECT_TIMEOUT = 60
+# The TCP connect alone gets this long before a fresh attempt. A Vita that is
+# rebooting or has just left Wi-Fi drops connection requests silently, and
+# one connect's own retransmissions back off so far that it can notice the
+# Vita's return up to a minute late. Waits behind a dead connection happen in
+# the TLS handshake, which keeps CONNECT_TIMEOUT.
+TCP_CONNECT_TIMEOUT = 5
 # Native work is synchronous on the Vita; keepalive notices a dead peer while
 # waiting, so a slow reply is waited for rather than abandoned.
 RESPONSE_TIMEOUT = 180
@@ -120,6 +126,13 @@ class UncertainOutcomeError(ClientError):
 
 class UploadTransportError(ClientError):
     """The same durable upload step may be retried after reconnecting."""
+
+
+def open_tcp(address, timeout, source_address=None):
+    """http.client's connection factory: a short TCP connect, then TIMEOUT for TLS and replies."""
+    sock = socket.create_connection(address, min(timeout, TCP_CONNECT_TIMEOUT), source_address)
+    sock.settimeout(timeout)
+    return sock
 
 
 def set_keepalive(sock):
@@ -871,6 +884,7 @@ class VitaClient:
         with private_pem(self.client_certificate) as certificate, private_pem(self.client_key) as key:
             context.load_cert_chain(certificate, key, password=lambda: '')
         connection = http.client.HTTPSConnection(self.host, self.port, timeout=max(self.timeout, CONNECT_TIMEOUT) if self.retry_disconnect else self.timeout, context=context)
+        connection._create_connection = open_tcp
         try:
             connection.connect()
             certificate = connection.sock.getpeercert(binary_form=True)
