@@ -80,7 +80,7 @@ class PushTransport:
     """One continuous reader; command callers receive only their RPC responses.
 
     HTTP event frames are unsolicited, complete, length-delimited messages. They
-    never interrupt JPEG/file bodies. No event read RPC or host polling loop.
+    never interrupt image/file bodies. No event read RPC or host polling loop.
     """
     def __init__(self, connection, emit, disconnected):
         self.connection, self.sock = connection, connection.sock

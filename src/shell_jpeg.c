@@ -4,6 +4,7 @@
  */
 
 #include "shell_jpeg.h"
+#include "frame.h"
 #include "vita_agent.h"
 #include <psp2/kernel/modulemgr.h>
 #include <taihen.h>
@@ -87,13 +88,15 @@ int vau_shell_capture_buffer(void **pixels, size_t *capacity)
 	return VAU_OK;
 }
 
-int vau_shell_jpeg(const void *pixels, unsigned width, unsigned height, unsigned pitch,
-                   void *output, size_t capacity, unsigned ratio, size_t *bytes)
+int vau_shell_encode(const void *pixels, unsigned width, unsigned height, unsigned pitch,
+                     void *output, size_t capacity, unsigned ratio, size_t *bytes,
+                     unsigned *format)
 {
-	if (!bytes)
+	if (!bytes || !format)
 		return VAU_INVALID;
 
-	*bytes = 0;
+	*bytes  = 0;
+	*format = VAU_FRAME_FORMAT_NONE;
 	if (!pixels || !output || !width || width > 960 || !height || height > 544 || pitch < width ||
 	    pitch > 960 || !capacity || capacity > INT_MAX || !ratio || ratio > 255) {
 		return VAU_INVALID;
@@ -133,13 +136,18 @@ int vau_shell_jpeg(const void *pixels, unsigned width, unsigned height, unsigned
 	if (rc < 0)
 		return rc;
 
-	unsigned char *jpeg = output;
-
-	if (rc < 4 || (size_t)rc > capacity || jpeg[0] != 0xff || jpeg[1] != 0xd8 ||
-	    jpeg[rc - 2] != 0xff || jpeg[rc - 1] != 0xd9) {
+	if ((size_t)rc > capacity)
 		return VAU_DEVICE_ERROR;
-	}
 
-	*bytes = (size_t)rc;
+	/* pngshot hooks this encoder on 3.65-3.68 and writes PNG into the same
+	 * stream. Its worst case, 960x544 RGBA deflated as stored blocks, is
+	 * under 2.1 MB, inside the JPEG bound sizes[0] and capacity. */
+	unsigned found = vau_frame_format(output, (size_t)rc);
+
+	if (found == VAU_FRAME_FORMAT_NONE)
+		return VAU_DEVICE_ERROR;
+
+	*bytes  = (size_t)rc;
+	*format = found;
 	return VAU_OK;
 }
