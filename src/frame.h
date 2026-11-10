@@ -21,11 +21,21 @@ enum vau_frame_stage {
 	VAU_FRAME_STAGE_COUNT
 };
 
+enum vau_frame_format {
+	VAU_FRAME_FORMAT_NONE,
+	VAU_FRAME_FORMAT_JPEG,
+	VAU_FRAME_FORMAT_PNG, /* pngshot replaces SceShell's encoder with its PNG writer. */
+};
+
 struct vau_frame {
 	VauFrameInfo capture;
-	const unsigned char *jpeg;
-	size_t jpeg_bytes;
+	const unsigned char *image;
+	size_t image_bytes;
+	unsigned format;
 	unsigned failure_stage; /* No image bytes are published on failure. */
 };
+
+/* JPEG: FF D8 ... FF D9. PNG: signature ... IEND chunk. */
+unsigned vau_frame_format(const unsigned char *image, size_t bytes);
 
 #endif

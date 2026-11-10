@@ -166,7 +166,7 @@ struct vau_native_api {
 	void (*approval_cancel)(void *);
 	int (*approval_pending)(void *);
 	int (*content_busy)(void *); /* Durable native mutation owns the filesystem. */
-	/* Successful frame capture loans one JPEG until release_frame. */
+	/* Successful frame capture loans one JPEG or PNG until release_frame. */
 	int (*frame)(void *context, struct vau_frame *out);
 	void (*release_frame)(void *context);
 
