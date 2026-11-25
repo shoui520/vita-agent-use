@@ -119,10 +119,11 @@ int vau_frames_capture(struct vau_frames *f, struct vau_frame *out)
 
 	out->failure_stage = VAU_FRAME_STAGE_JPEG_ENCODE;
 
-	size_t bytes = 0;
+	size_t bytes    = 0;
+	unsigned format = VAU_FRAME_FORMAT_NONE;
 
-	rc = vau_shell_jpeg(f->raw, fb.width, fb.height, fb.pitch, f->jpeg, VAU_SHELL_JPEG_BYTES,
-	                    f->ratio, &bytes);
+	rc = vau_shell_encode(f->raw, fb.width, fb.height, fb.pitch, f->jpeg, VAU_SHELL_JPEG_BYTES,
+	                      f->ratio, &bytes, &format);
 	if (rc < 0)
 		return rc;
 
@@ -137,8 +138,9 @@ int vau_frames_capture(struct vau_frames *f, struct vau_frame *out)
 		                                 .started_us   = started,
 		                                 .finished_us  = finished };
 	out->failure_stage = VAU_FRAME_STAGE_NONE;
-	out->jpeg          = f->jpeg;
-	out->jpeg_bytes    = bytes;
+	out->image         = f->jpeg;
+	out->image_bytes   = bytes;
+	out->format        = format;
 	f->borrowed        = 1;
 	return VAU_OK;
 }

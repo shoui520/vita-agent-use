@@ -354,6 +354,18 @@ def valid_display_observation(display):
             type(display['process']) is int and 0 < display['process'] < 2**31)
 
 
+def frame_format(data):
+    """Return 'jpeg' or 'png' for a complete capture image, otherwise None.
+
+    SceShell's encoder writes JPEG; with pngshot loaded it writes PNG instead.
+    """
+    if len(data) >= 4 and data.startswith(b'\xff\xd8') and data.endswith(b'\xff\xd9'):
+        return 'jpeg'
+    if len(data) >= 20 and data.startswith(b'\x89PNG\r\n\x1a\n') and data.endswith(b'\0\0\0\0IEND\xaeB`\x82'):
+        return 'png'
+    return None
+
+
 def strict_json(data):
     def object_pairs(pairs):
         obj = {}
@@ -1081,7 +1093,7 @@ class VitaClient:
             self._recovering = False
 
     def frame(self):
-        """Return (JPEG bytes, metadata) without consuming a command sequence ID."""
+        """Return (JPEG or PNG bytes, metadata) without consuming a command sequence ID."""
         self._ensure_screen()
         # Right after display-on the compositor may not have a frame yet.
         deadline = time.monotonic() + 3
@@ -1129,9 +1141,10 @@ class VitaClient:
                                 -(2**31) <= error['code'] < 2**31):
                             raise NativeFrameError(response.status, error['code'], error.get('stage'), error.get('display'),error.get('name'),error.get('message'))
                     raise ClientError('Frame capture rejected (status %d).' % response.status)
-                if response.headers.get('Content-Type', '').lower() != 'image/jpeg' or not data.startswith(b'\xff\xd8') or not data.endswith(b'\xff\xd9'):
-                    raise ClientError('Invalid JPEG frame response.')
-                metadata = {}
+                image_format = frame_format(data)
+                if image_format is None or response.headers.get('Content-Type', '').lower() != 'image/' + image_format:
+                    raise ClientError('Invalid frame image response.')
+                metadata = {'format': image_format}
                 for key, maximum in (('Width', 960), ('Height', 544), ('Process', 2**31-1),
                                      ('Capture-Start', 2**64-1), ('Capture-End', 2**64-1)):
                     values = response.headers.get_all('X-Vita-' + key, [])
@@ -1851,12 +1864,12 @@ def main(argv=None, *, screen_off_when_done=True, host=None, agent_name=None):
                 fd = os.open(args['output'], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
                 try:
                     with os.fdopen(fd, 'wb') as stream:
-                        jpeg, metadata = client.frame()
-                        stream.write(jpeg)
+                        image, metadata = client.frame()
+                        stream.write(image)
                 except BaseException:
                     os.unlink(args['output'])
                     raise
-                result = {'status': 'ok', 'file': args['output'], 'bytes': len(jpeg), **metadata}
+                result = {'status': 'ok', 'file': args['output'], 'bytes': len(image), **metadata}
             else:
                 result = client.recover() if request == {'op': 'client.recover', 'args': {}} else client.call(request['op'], request['args'])
             emit(result)

@@ -15,6 +15,7 @@ import uuid
 from vita_client import ClientError, NativeFrameError, UncertainOutcomeError, UploadError, VitaClient, private_json, strict_json, validate_host, validate_agent_name, connection_refused_message, set_screen_hold
 
 CONFIG_ENV = "VITA_AGENT_CONFIG_DIR"
+CAPTURE_SUFFIXES = {'jpeg': ('.jpg', '.jpeg'), 'png': ('.png',)}
 # bootstrap's default directory, used when the environment names none.
 DEFAULT_CONFIG_DIR = Path(__file__).resolve().parent.parent / 'agent' / 'vita-agent-use'
 
@@ -59,9 +60,9 @@ def parser():
     c.add_argument('--operation-id', help='Reuse this ID to inspect/resume the same native job.')
     c.add_argument('--timeout', type=float, default=1800)
     c.add_argument('--no-wait', action='store_true', help='Return the job ID; query using call decrypt.status.')
-    g = group('screen', 'Display control and JPEG capture.')
+    g = group('screen', 'Display control and JPEG or PNG capture.')
     cmd(g, 'on', 'screen.on'); cmd(g, 'off', 'screen.off')
-    cmd(g, 'capture').add_argument('--output', type=Path, help='JPEG path; defaults to vita-capture-DATE-TIME.jpg in the current directory.')
+    cmd(g, 'capture').add_argument('--output', type=Path, help='Image path; its extension is replaced when it does not match the captured format (.jpg or .png). Defaults to vita-capture-DATE-TIME with that extension in the current directory.')
     g = group('fs', 'Complete listings, transfers and native write operations.')
     c = cmd(g, 'list', 'fs.list'); c.add_argument('path'); listing(c)
     c.add_argument('--sort-by', choices=('name','modified','date','size'), default='name')
@@ -272,11 +273,13 @@ def execute(a,c,emit_result=emit):
         from system_metadata import collect
         return {'status':'ok','result':collect(c)}
     if g=='screen':
-        def capture(stream):
-            data,meta=c.frame();stream.write(data);return len(data),meta
-        a.output=a.output or Path(time.strftime('vita-capture-%Y%m%d-%H%M%S.jpg'))
-        (size,meta),replaced=write_output(a.output,capture)
-        result={'status':'ok','file':str(a.output),'bytes':size,**meta}
+        data,meta=c.frame()
+        # pngshot makes the Vita encode PNG: name the file for what it holds.
+        output=a.output or Path(time.strftime('vita-capture-%Y%m%d-%H%M%S'))
+        if output.suffix.lower() not in CAPTURE_SUFFIXES[meta['format']]:
+            output=output.with_suffix(CAPTURE_SUFFIXES[meta['format']][0])
+        _,replaced=write_output(output,lambda stream:stream.write(data))
+        result={'status':'ok','file':str(output),'bytes':len(data),**meta}
         if replaced:result['replaced']=True
         return result
     if g=='fs':

@@ -22,7 +22,7 @@ static void release_frame(struct vau_connection *c)
 
 /*
  * A frame response goes out in two parts without copying: the HTTP header from
- * c->output up to binary_header, then the JPEG straight from the capture pool.
+ * c->output up to binary_header, then the image straight from the capture pool.
  */
 const unsigned char *vau_connection_output(const struct vau_connection *c, size_t *size)
 {
@@ -38,8 +38,8 @@ const unsigned char *vau_connection_output(const struct vau_connection *c, size_
 	if (c->binary_header && c->output_sent >= c->binary_header) {
 		size_t offset = c->output_sent - c->binary_header;
 
-		p     = c->frame.jpeg + offset;
-		*size = c->frame.jpeg_bytes - offset;
+		p     = c->frame.image + offset;
+		*size = c->frame.image_bytes - offset;
 	} else {
 		p     = (const unsigned char *)c->output + c->output_sent;
 		*size = (c->binary_header ? c->binary_header : c->output_size) - c->output_sent;
@@ -159,8 +159,10 @@ static int capture(struct vau_connection *c, struct vau_service *s,
 
 						VauFrameInfo *i = &c->frame.capture;
 
-						if (c->frame.jpeg && c->frame.jpeg_bytes >= 4 &&
-						    c->frame.jpeg_bytes <= VAU_FRAME_JPEG_LIMIT && i->size == sizeof(*i) &&
+						if (c->frame.format != VAU_FRAME_FORMAT_NONE &&
+						    vau_frame_format(c->frame.image, c->frame.image_bytes) ==
+						            c->frame.format &&
+						    c->frame.image_bytes <= VAU_FRAME_JPEG_LIMIT && i->size == sizeof(*i) &&
 						    i->abi == VAU_ABI && i->width && i->width <= 960 && i->height &&
 						    i->height <= 544 && i->process_id > 0 &&
 						    i->finished_us >= i->started_us) {
@@ -572,11 +574,12 @@ int vau_connection_feed(struct vau_connection *c, struct vau_service *s,
 		VauFrameInfo *i = &c->frame.capture;
 		int n           = vau_snprintf(
                 c->output, VAU_CONNECTION_HEADER_BYTES,
-                "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: %zu\r\n"
+                "HTTP/1.1 200 OK\r\nContent-Type: image/%s\r\nContent-Length: %zu\r\n"
 		                  "Cache-Control: no-store\r\nConnection: %s\r\n"
 		                  "X-Vita-Width: %u\r\nX-Vita-Height: %u\r\nX-Vita-Process: %" PRId32 "\r\n"
 		                  "X-Vita-Capture-Start: %" PRIu64 "\r\nX-Vita-Capture-End: %" PRIu64 "\r\n\r\n",
-                c->frame.jpeg_bytes, c->close_after_response ? "close" : "keep-alive", i->width,
+                c->frame.format == VAU_FRAME_FORMAT_PNG ? "png" : "jpeg", c->frame.image_bytes,
+                c->close_after_response ? "close" : "keep-alive", i->width,
                 i->height, i->process_id, i->started_us, i->finished_us);
 
 		if (n < 0 || (unsigned)n >= VAU_CONNECTION_HEADER_BYTES) {
@@ -586,7 +589,7 @@ int vau_connection_feed(struct vau_connection *c, struct vau_service *s,
 		}
 
 		c->binary_header = (size_t)n;
-		c->output_size   = (size_t)n + c->frame.jpeg_bytes;
+		c->output_size   = (size_t)n + c->frame.image_bytes;
 		c->output_sent   = 0;
 		c->state         = VAU_CONNECTION_WRITING;
 		c->phase_us      = now;

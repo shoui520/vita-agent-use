@@ -7,7 +7,7 @@ endif()
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
-add_library(vau_core STATIC src/decrypt.c src/module_variable.c src/content_media_paths.c src/sfo_titles.c src/content_delete.c src/content_scope_json.c src/content_sdk.c src/content_media.c src/content_media_catalog.c src/content_media_session.c src/log_watch.c src/log_marker.c src/event_ring.c src/tty_ring.c src/touch_sample.c src/file_ops.c src/input_owner.c src/timeline.c src/stop_monitor.c src/policy.c src/acl_config.c src/tai_config_guard.c src/write_ops.c src/write_changes.c src/upload_wire.c src/native_ops.c src/system_metadata.c src/performance.c src/json.c src/sha256.c src/protocol.c src/input_sequence.c src/http.c src/auth.c src/service.c src/notification.c src/pairing_prompt.c src/pairing_request.c src/connection.c src/ui_job.c)
+add_library(vau_core STATIC src/frame.c src/decrypt.c src/module_variable.c src/content_media_paths.c src/sfo_titles.c src/content_delete.c src/content_scope_json.c src/content_sdk.c src/content_media.c src/content_media_catalog.c src/content_media_session.c src/log_watch.c src/log_marker.c src/event_ring.c src/tty_ring.c src/touch_sample.c src/file_ops.c src/input_owner.c src/timeline.c src/stop_monitor.c src/policy.c src/acl_config.c src/tai_config_guard.c src/write_ops.c src/write_changes.c src/upload_wire.c src/native_ops.c src/system_metadata.c src/performance.c src/json.c src/sha256.c src/protocol.c src/input_sequence.c src/http.c src/auth.c src/service.c src/notification.c src/pairing_prompt.c src/pairing_request.c src/connection.c src/ui_job.c)
 target_include_directories(vau_core PUBLIC include PRIVATE src)
 target_compile_options(vau_core PRIVATE -Wall -Wextra -Werror "$<$<CONFIG:Release>:-O2>")
 

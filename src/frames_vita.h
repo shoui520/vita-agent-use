@@ -13,7 +13,8 @@
 #define VAU_FRAME_YUV_BYTES  (960u * 544u * 3u / 2u)
 #define VAU_FRAME_JPEG_BYTES (1024u * 1024u)
 
-/* Exact PS+START JPEG size bound, Shell 3.65 function 0x366206. */
+/* Exact PS+START JPEG size bound, Shell 3.65 function 0x366206. Also holds
+ * pngshot's worst-case PNG; see vau_shell_encode. */
 #define VAU_SHELL_JPEG_BYTES    VAU_FRAME_JPEG_LIMIT
 #define VAU_FRAME_PAGE_BYTES(n) (((n) + 4095u) & ~4095u)
 #define VAU_FRAME_POOL_BYTES                                                                 \

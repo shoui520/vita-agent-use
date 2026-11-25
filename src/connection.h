@@ -59,7 +59,7 @@ int vau_connection_feed(struct vau_connection *, struct vau_service *,
 
 /* Segments at most 4096 bytes; pointer/size stable across retryable TLS writes.
  * Advance only accepted bytes. No next request before response completion.
- * JPEG borrows the capture pool; file chunks use bounded connection storage. */
+ * Frame images borrow the capture pool; file chunks use bounded connection storage. */
 int vau_connection_written(struct vau_connection *, struct vau_service *, uint64_t, size_t);
 const unsigned char *vau_connection_output(const struct vau_connection *, size_t *);
 int vau_connection_push(struct vau_connection *, struct vau_service *,

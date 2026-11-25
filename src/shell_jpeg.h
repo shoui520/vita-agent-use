@@ -9,9 +9,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* SceShell's PS+START JPEG encoder, with an in-memory output stream. */
+/* SceShell's PS+START encoder, with an in-memory output stream. It writes JPEG,
+ * or PNG when pngshot replaces it; format is a vau_frame_format. */
 int vau_shell_capture_buffer(void **pixels, size_t *capacity);
-int vau_shell_jpeg(const void *pixels, unsigned width, unsigned height, unsigned pitch,
-                   void *output, size_t capacity, unsigned ratio, size_t *bytes);
+int vau_shell_encode(const void *pixels, unsigned width, unsigned height, unsigned pitch,
+                     void *output, size_t capacity, unsigned ratio, size_t *bytes,
+                     unsigned *format);
 
 #endif

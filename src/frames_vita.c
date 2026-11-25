@@ -170,8 +170,9 @@ int vau_frames_capture(struct vau_frames *f, struct vau_frame *out)
 
 	out->failure_stage = VAU_FRAME_STAGE_NONE;
 	out->capture       = info;
-	out->jpeg          = f->jpeg;
-	out->jpeg_bytes    = bytes;
+	out->image         = f->jpeg;
+	out->image_bytes   = bytes;
+	out->format        = VAU_FRAME_FORMAT_JPEG;
 	f->borrowed        = 1;
 	return VAU_OK;
 }
